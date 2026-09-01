@@ -2,12 +2,32 @@ import { getButtons, getDislikeButton, getLikeButton } from "./buttons";
 import { extConfig, isMobile, isLikesDisabled, isNewDesign, isRoundedDesign, isShorts } from "./state";
 import { getColorFromTheme, isInViewport, querySelector } from "./utils";
 
+function closestConfigured(element, selectors) {
+  for (const selector of Array.isArray(selectors) ? selectors : [selectors]) {
+    const match = selector ? element?.closest(selector) : null;
+    if (match) return match;
+  }
+  return null;
+}
+
+function findInCurrentWatchTree(buttons, selectors, fallbackScope = null) {
+  const closest = closestConfigured(buttons, selectors);
+  if (closest) return closest;
+  const watchRoot = buttons?.closest("ytd-watch-flexy, ytd-watch-grid");
+  const scope = fallbackScope ?? watchRoot;
+  return scope ? querySelector(selectors, scope) : undefined;
+}
+
 function createRateBar(likes, dislikes) {
-  let rateBar = document.getElementById("ryd-bar-container");
+  const buttons = getButtons();
+  for (const wrapper of document.querySelectorAll(".ryd-tooltip")) {
+    if (!buttons?.contains(wrapper)) wrapper.remove();
+  }
+  let rateBar = buttons?.querySelector("#ryd-bar-container");
   if (!isLikesDisabled()) {
     // sometimes rate bar is hidden
     if (rateBar && !isInViewport(rateBar)) {
-      rateBar.remove();
+      (rateBar.closest(".ryd-tooltip") ?? rateBar).remove();
       rateBar = null;
     }
 
@@ -52,10 +72,7 @@ function createRateBar(likes, dislikes) {
           colorLikeStyle = "; background-color: " + getColorFromTheme(true);
           colorDislikeStyle = "; background-color: " + getColorFromTheme(false);
         }
-        let actions =
-          isNewDesign() && getButtons() === querySelector(extConfig.selectors.rateBar.newDesignActions)
-            ? getButtons()
-            : querySelector(extConfig.selectors.rateBar.oldDesignActions);
+        const actions = buttons;
         (actions || querySelector(extConfig.selectors.rateBar.mobileActionBar)).insertAdjacentHTML(
           "beforeend",
           `
@@ -80,30 +97,43 @@ function createRateBar(likes, dislikes) {
 
         if (isNewDesign()) {
           // Add border between info and comments
-          let descriptionAndActionsElement = querySelector(extConfig.selectors.rateBar.topRow);
-          descriptionAndActionsElement.style.borderBottom = "1px solid var(--yt-spec-10-percent-layer)";
-          descriptionAndActionsElement.style.paddingBottom = "10px";
+          const descriptionAndActionsElement = findInCurrentWatchTree(buttons, extConfig.selectors.rateBar.topRow);
+          if (descriptionAndActionsElement) {
+            descriptionAndActionsElement.style.borderBottom = "1px solid var(--yt-spec-10-percent-layer)";
+            descriptionAndActionsElement.style.paddingBottom = "10px";
+          }
 
           // Fix like/dislike ratio bar offset in new UI
-          querySelector(extConfig.selectors.rateBar.actionsInner).style.width = "revert";
+          const actionsInner = findInCurrentWatchTree(
+            buttons,
+            extConfig.selectors.rateBar.actionsInner,
+            descriptionAndActionsElement,
+          );
+          if (actionsInner) actionsInner.style.width = "revert";
           if (isRoundedDesign()) {
-            querySelector(extConfig.selectors.rateBar.actions).style.flexDirection = "row-reverse";
+            const actions = findInCurrentWatchTree(
+              buttons,
+              extConfig.selectors.rateBar.actions,
+              descriptionAndActionsElement,
+            );
+            if (actions) actions.style.flexDirection = "row-reverse";
           }
         }
       } else {
-        document.querySelector(`.ryd-tooltip`).style.width = widthPx + "px";
-        document.getElementById("ryd-bar").style.width = widthPercent + "%";
-        document.querySelector("#ryd-dislike-tooltip > #tooltip").innerHTML = tooltipInnerHTML;
+        buttons.querySelector(`.ryd-tooltip`).style.width = widthPx + "px";
+        buttons.querySelector("#ryd-bar").style.width = widthPercent + "%";
+        const tooltip = buttons.querySelector("#ryd-dislike-tooltip > #tooltip");
+        if (tooltip) tooltip.innerHTML = tooltipInnerHTML;
         if (extConfig.coloredBar) {
-          document.getElementById("ryd-bar-container").style.backgroundColor = getColorFromTheme(false);
-          document.getElementById("ryd-bar").style.backgroundColor = getColorFromTheme(true);
+          buttons.querySelector("#ryd-bar-container").style.backgroundColor = getColorFromTheme(false);
+          buttons.querySelector("#ryd-bar").style.backgroundColor = getColorFromTheme(true);
         }
       }
     }
   } else {
     console.log("removing bar");
     if (rateBar) {
-      rateBar.parentNode.removeChild(rateBar);
+      (rateBar.closest(".ryd-tooltip") ?? rateBar).remove();
     }
   }
 }

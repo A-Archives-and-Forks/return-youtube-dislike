@@ -1,8 +1,21 @@
-import { getButtons } from "./src/buttons";
-import { isShorts, setInitialState, initExtConfig } from "./src/state";
-import { getBrowser, isVideoLoaded } from "./src/utils";
+import { getButtons, getDislikeButton, getLikeButton, hasRenderedBox, markButtonsForVideo } from "./src/buttons";
+import {
+  hasLoadedStateForVideo,
+  initExtConfig,
+  isLikesDisabled,
+  isShorts,
+  restoreCurrentState,
+  setInitialState,
+} from "./src/state";
+import { getBrowser, getVideoId, isVideoLoaded } from "./src/utils";
 import { addLikeDislikeEventListener, createSmartimationObserver, storageChangeHandler } from "./src/events";
+import { createInitializationCycleRunner } from "./src/initialization-cycle";
 import { initPatreonFeatures } from "./src/patreon";
+
+if (__RYD_LIVE_TEST_BUILD__) {
+  document.documentElement.setAttribute("data-ryd-extension-version", getBrowser().runtime.getManifest().version);
+  document.documentElement.setAttribute("data-ryd-extension-build", __RYD_LIVE_BUILD_ID__);
+}
 
 await initExtConfig();
 initPatreonFeatures();
@@ -12,6 +25,11 @@ let isSetInitialStateDone = false;
 let isStorageListenerRegistered = false;
 let shortsNavigationObserver = null;
 let shortsNavigationObserverTarget = null;
+let initializedVideoId = null;
+let initializedButtons = null;
+let initializedLikeButton = null;
+let initializedDislikeButton = null;
+let initializationCheckRunning = false;
 
 function ensureShortsNavigationObserver() {
   if (!isShorts()) {
@@ -51,19 +69,44 @@ function ensureShortsNavigationObserver() {
 }
 
 async function checkForInitialization() {
+  if (initializationCheckRunning) return;
+  initializationCheckRunning = true;
   try {
     if (isShorts()) {
       ensureShortsNavigationObserver();
     }
 
-    if ((isShorts() && isVideoLoaded()) || (getButtons()?.offsetParent && isVideoLoaded())) {
+    const buttons = getButtons();
+    const videoId = getVideoId(window.location.href);
+    if ((isShorts() && isVideoLoaded()) || (hasRenderedBox(buttons) && isVideoLoaded())) {
+      if (!buttons) return;
+      const likeButton = getLikeButton();
+      const dislikeButton = getDislikeButton();
+      if (!likeButton || !dislikeButton) return;
       if (jsInitChecktimer !== null) {
         clearInterval(jsInitChecktimer);
         jsInitChecktimer = null;
       }
+      markButtonsForVideo(buttons, videoId);
       createSmartimationObserver();
       addLikeDislikeEventListener();
-      await setInitialState();
+      if (hasLoadedStateForVideo(videoId)) {
+        restoreCurrentState();
+      } else {
+        await setInitialState();
+      }
+      if (
+        videoId !== getVideoId(window.location.href) ||
+        buttons !== getButtons() ||
+        likeButton !== getLikeButton() ||
+        dislikeButton !== getDislikeButton()
+      ) {
+        return;
+      }
+      initializedVideoId = videoId;
+      initializedButtons = buttons;
+      initializedLikeButton = likeButton;
+      initializedDislikeButton = dislikeButton;
       isSetInitialStateDone = true;
       if (!isStorageListenerRegistered) {
         getBrowser().storage.onChanged.addListener(storageChangeHandler);
@@ -71,14 +114,13 @@ async function checkForInitialization() {
       }
     }
   } catch (exception) {
-    if (!isSetInitialStateDone) {
-      console.log("error");
-      await setInitialState();
-    }
+    console.warn("Initialization failed; retrying when the current controls are ready.", exception);
+  } finally {
+    initializationCheckRunning = false;
   }
 }
 
-async function triggerInitializationCycle() {
+const initializationCycle = createInitializationCycleRunner(async () => {
   isSetInitialStateDone = false;
 
   if (jsInitChecktimer !== null) {
@@ -99,6 +141,10 @@ async function triggerInitializationCycle() {
       }
     }, 2000);
   }
+});
+
+function triggerInitializationCycle() {
+  return initializationCycle.request();
 }
 
 async function setEventListeners() {
@@ -110,6 +156,34 @@ await setEventListeners();
 document.addEventListener("yt-navigate-finish", async function (event) {
   await setEventListeners();
 });
+
+function watchControlsNeedInitialization() {
+  const videoId = getVideoId(window.location.href);
+  if (!videoId || initializationCycle.isRunning() || jsInitChecktimer !== null) return false;
+  const buttons = getButtons();
+  if (!buttons) return true;
+  const likeButton = getLikeButton();
+  const dislikeButton = getDislikeButton();
+  return (
+    initializedVideoId !== videoId ||
+    initializedButtons !== buttons ||
+    initializedLikeButton !== likeButton ||
+    initializedDislikeButton !== dislikeButton ||
+    !buttons?.isConnected ||
+    !likeButton?.isConnected ||
+    !dislikeButton?.isConnected ||
+    !buttons?.contains(likeButton) ||
+    !buttons?.contains(dislikeButton) ||
+    (!isShorts() &&
+      hasLoadedStateForVideo(videoId) &&
+      !isLikesDisabled() &&
+      !buttons.querySelector("#ryd-bar-container"))
+  );
+}
+
+setInterval(() => {
+  if (watchControlsNeedInitialization()) void triggerInitializationCycle();
+}, 500);
 
 const s = document.createElement("script");
 s.src = chrome.runtime.getURL("menu-fixer.js");

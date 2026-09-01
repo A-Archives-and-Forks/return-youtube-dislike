@@ -11,9 +11,7 @@ import {
   createObserver,
 } from "./utils";
 import { config, getApiEndpoint, DEV_API_URL, PROD_API_URL, isDevelopment } from "./config";
-const LIKED_STATE = "LIKED_STATE";
-const DISLIKED_STATE = "DISLIKED_STATE";
-const NEUTRAL_STATE = "NEUTRAL_STATE";
+import { LIKED_STATE, DISLIKED_STATE, NEUTRAL_STATE } from "../../common/vote-transition";
 
 const DEFAULT_SELECTORS = {
   dislikeTextContainer: [
@@ -140,6 +138,7 @@ let storedData = {
   likes: 0,
   dislikes: 0,
   previousState: NEUTRAL_STATE,
+  videoId: null,
 };
 
 function isMobile() {
@@ -317,7 +316,10 @@ function processResponse(response, storedData) {
 }
 
 // Tells the user if the API is down
-function displayError(error) {
+function displayError(error, videoId = getVideoId(window.location.href)) {
+  if (getVideoId(window.location.href) !== videoId) {
+    return;
+  }
   getDislikeTextContainer().innerText = localize("textTempUnavailable");
 }
 
@@ -326,33 +328,52 @@ async function setState(storedData) {
     window.__rydSetStateCalls = (window.__rydSetStateCalls || 0) + 1;
   }
   storedData.previousState = isVideoDisliked() ? DISLIKED_STATE : isVideoLiked() ? LIKED_STATE : NEUTRAL_STATE;
-  let statsSet = false;
   console.log("Video is loaded. Adding buttons...");
 
-  let videoId = getVideoId(window.location.href);
-  let likeCount = getLikeCountFromButton() || null;
-
-  let response = await fetch(getApiEndpoint(`/votes?videoId=${videoId}&likeCount=${likeCount || ""}`), {
-    method: "GET",
-    headers: {
-      Accept: "application/json",
-    },
-  })
-    .then((response) => {
-      if (!response.ok) displayError(response.error);
-      return response;
-    })
-    .then((response) => response.json())
-    .catch(displayError);
+  const videoId = getVideoId(window.location.href);
+  const likeCount = getLikeCountFromButton() || null;
+  let response;
+  try {
+    const request = await fetch(getApiEndpoint(`/votes?videoId=${videoId}&likeCount=${likeCount || ""}`), {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+      },
+    });
+    if (!request.ok) {
+      displayError(request.error, videoId);
+      return;
+    }
+    response = await request.json();
+  } catch (error) {
+    displayError(error, videoId);
+    return;
+  }
   console.log("response from api:");
   console.log(JSON.stringify(response));
-  if (response !== undefined && !("traceId" in response) && !statsSet) {
-    processResponse(response, storedData);
+  if (getVideoId(window.location.href) !== videoId) {
+    return;
   }
+  if (!response || typeof response !== "object" || "traceId" in response) {
+    displayError(response, videoId);
+    return;
+  }
+  processResponse(response, storedData);
+  storedData.videoId = videoId;
 }
 
 async function setInitialState() {
   await setState(storedData);
+}
+
+function hasLoadedStateForVideo(videoId) {
+  return storedData.videoId === videoId;
+}
+
+function restoreCurrentState() {
+  storedData.previousState = isVideoDisliked() ? DISLIKED_STATE : isVideoLiked() ? LIKED_STATE : NEUTRAL_STATE;
+  setDislikes(numberFormat(storedData.dislikes));
+  createRateBar(storedData.likes, storedData.dislikes);
 }
 
 async function initExtConfig() {
@@ -508,4 +529,6 @@ export {
   initExtConfig,
   storedData,
   isLikesDisabled,
+  hasLoadedStateForVideo,
+  restoreCurrentState,
 };

@@ -1,24 +1,25 @@
 import { getBrowser, getVideoId, numberFormat, createObserver, querySelector } from "./utils";
 import { checkForSignInButton, getButtons, getDislikeButton, getLikeButton } from "./buttons";
-import {
-  NEUTRAL_STATE,
-  LIKED_STATE,
-  DISLIKED_STATE,
-  setDislikes,
-  extConfig,
-  storedData,
-  setLikes,
-  getLikeCountFromButton,
-} from "./state";
+import { setDislikes, extConfig, storedData, setLikes, getLikeCountFromButton } from "./state";
 import { createRateBar } from "./bar";
+import {
+  LIKE_ACTION,
+  DISLIKE_ACTION,
+  resolveVoteTransition,
+  applyVoteTransitionCounts,
+  shouldSubmitVote,
+} from "../../common/vote-transition";
 
 function sendVote(vote) {
-  if (extConfig.disableVoteSubmission !== true) {
-    getBrowser().runtime.sendMessage({
+  if (shouldSubmitVote({ disableVoteSubmission: extConfig.disableVoteSubmission })) {
+    const result = getBrowser().runtime.sendMessage({
       message: "send_vote",
       vote: vote,
       videoId: getVideoId(window.location.href),
     });
+    if (result && typeof result.catch === "function") {
+      result.catch((error) => console.error("Vote submission failed", error));
+    }
   }
 }
 
@@ -27,25 +28,16 @@ function updateDOMDislikes() {
   createRateBar(storedData.likes, storedData.dislikes);
 }
 
-function likeClicked() {
+function handleVoteAction(action) {
   if (checkForSignInButton() === false) {
-    if (storedData.previousState === DISLIKED_STATE) {
-      sendVote(1);
-      if (storedData.dislikes > 0) storedData.dislikes--;
-      storedData.likes++;
-      updateDOMDislikes();
-      storedData.previousState = LIKED_STATE;
-    } else if (storedData.previousState === NEUTRAL_STATE) {
-      sendVote(1);
-      storedData.likes++;
-      updateDOMDislikes();
-      storedData.previousState = LIKED_STATE;
-    } else if ((storedData.previousState = LIKED_STATE)) {
-      sendVote(0);
-      if (storedData.likes > 0) storedData.likes--;
-      updateDOMDislikes();
-      storedData.previousState = NEUTRAL_STATE;
-    }
+    const transition = resolveVoteTransition(storedData.previousState, action);
+    const counts = applyVoteTransitionCounts(storedData.likes, storedData.dislikes, transition);
+    sendVote(transition.value);
+    storedData.likes = counts.likes;
+    storedData.dislikes = counts.dislikes;
+    storedData.previousState = transition.nextState;
+    updateDOMDislikes();
+
     if (extConfig.numberDisplayReformatLikes === true) {
       const nativeLikes = getLikeCountFromButton();
       if (nativeLikes !== false) {
@@ -55,45 +47,29 @@ function likeClicked() {
   }
 }
 
-function dislikeClicked() {
-  if (checkForSignInButton() == false) {
-    if (storedData.previousState === NEUTRAL_STATE) {
-      sendVote(-1);
-      storedData.dislikes++;
-      updateDOMDislikes();
-      storedData.previousState = DISLIKED_STATE;
-    } else if (storedData.previousState === DISLIKED_STATE) {
-      sendVote(0);
-      if (storedData.dislikes > 0) storedData.dislikes--;
-      updateDOMDislikes();
-      storedData.previousState = NEUTRAL_STATE;
-    } else if (storedData.previousState === LIKED_STATE) {
-      sendVote(-1);
-      if (storedData.likes > 0) storedData.likes--;
-      storedData.dislikes++;
-      updateDOMDislikes();
-      storedData.previousState = DISLIKED_STATE;
-      if (extConfig.numberDisplayReformatLikes === true) {
-        const nativeLikes = getLikeCountFromButton();
-        if (nativeLikes !== false) {
-          setLikes(numberFormat(nativeLikes));
-        }
-      }
-    }
-  }
+function likeClicked() {
+  handleVoteAction(LIKE_ACTION);
 }
 
+function dislikeClicked() {
+  handleVoteAction(DISLIKE_ACTION);
+}
+
+const boundLikeButtons = new WeakSet();
+const boundDislikeButtons = new WeakSet();
+
 function addLikeDislikeEventListener() {
-  if (window.rydPreNavigateLikeButton !== getLikeButton()) {
-    getLikeButton().addEventListener("click", likeClicked);
-    getLikeButton().addEventListener("touchstart", likeClicked);
-    if (getDislikeButton()) {
-      getDislikeButton().addEventListener("click", dislikeClicked);
-      getDislikeButton().addEventListener("touchstart", dislikeClicked);
-      getDislikeButton().addEventListener("focusin", updateDOMDislikes);
-      getDislikeButton().addEventListener("focusout", updateDOMDislikes);
-    }
-    window.rydPreNavigateLikeButton = getLikeButton();
+  const likeButton = getLikeButton();
+  const dislikeButton = getDislikeButton();
+  if (likeButton && !boundLikeButtons.has(likeButton)) {
+    likeButton.addEventListener("click", likeClicked);
+    boundLikeButtons.add(likeButton);
+  }
+  if (dislikeButton && !boundDislikeButtons.has(dislikeButton)) {
+    dislikeButton.addEventListener("click", dislikeClicked);
+    dislikeButton.addEventListener("focusin", updateDOMDislikes);
+    dislikeButton.addEventListener("focusout", updateDOMDislikes);
+    boundDislikeButtons.add(dislikeButton);
   }
 }
 

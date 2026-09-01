@@ -1,4 +1,6 @@
 import { config, getApiUrl, getApiEndpoint, getChangelogUrl } from "./src/config";
+import { createVoteClient } from "../common/vote-client";
+import { createBrowserCredentialStore } from "./src/vote-client-adapter";
 
 const apiUrl = getApiUrl();
 const voteDisabledIconName = config.voteDisabledIconName;
@@ -13,7 +15,15 @@ let extConfig = { ...config.defaultExtConfig };
 if (isChrome()) api = chrome;
 else if (isFirefox()) api = browser;
 
+const voteClient = createVoteClient({
+  apiBaseUrl: apiUrl,
+  fetchImpl: (...args) => fetch(...args),
+  credentialStore: createBrowserCredentialStore(api.storage.sync, () => api.runtime?.lastError),
+  cryptoImpl: globalThis.crypto,
+});
+
 initExtConfig();
+voteClient.ensureRegistered().catch((error) => console.error("Vote registration failed", error));
 
 function broadcastPatreonStatus(authenticated, user, sessionToken) {
   chrome.tabs.query({}, (tabs) => {
@@ -175,10 +185,16 @@ api.runtime.onMessage.addListener((request, sender, sendResponse) => {
       toSend = [];
     }
   } else if (request.message == "register") {
-    register();
+    voteClient
+      .ensureRegistered()
+      .then(({ userId }) => sendResponse?.({ success: true, userId }))
+      .catch((error) => sendResponse?.({ success: false, error: error.message }));
     return true;
   } else if (request.message == "send_vote") {
-    sendVote(request.videoId, request.vote);
+    voteClient
+      .submitVote(request.videoId, request.vote)
+      .then(() => sendResponse?.({ success: true }))
+      .catch((error) => sendResponse?.({ success: false, error: error.message }));
     return true;
   } else if (request.message === "patreon_oauth_login") {
     (async () => {
@@ -486,155 +502,8 @@ if (api?.runtime?.onStartup && typeof api.runtime.onStartup.addListener === "fun
 //   }
 // });
 
-async function sendVote(videoId, vote, depth = 1) {
-  api.storage.sync.get(null, async (storageResult) => {
-    if (!storageResult.userId || !storageResult.registrationConfirmed) {
-      await register();
-    }
-    let voteResponse = await fetch(getApiEndpoint("/interact/vote"), {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        userId: storageResult.userId,
-        videoId,
-        value: vote,
-      }),
-    });
-
-    if (voteResponse.status == 401 && depth > 0) {
-      await register();
-      await sendVote(videoId, vote, depth - 1);
-      return;
-    } else if (voteResponse.status == 401) {
-      // We have already tried registering
-      return;
-    }
-
-    const voteResponseJson = await voteResponse.json();
-    const solvedPuzzle = await solvePuzzle(voteResponseJson);
-    if (!solvedPuzzle.solution) {
-      await sendVote(videoId, vote);
-      return;
-    }
-
-    await fetch(getApiEndpoint("/interact/confirmVote"), {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        ...solvedPuzzle,
-        userId: storageResult.userId,
-        videoId,
-      }),
-    });
-  });
-}
-
-async function register() {
-  const userId = generateUserID();
-  api.storage.sync.set({ userId });
-  const registrationResponse = await fetch(getApiEndpoint(`/puzzle/registration?userId=${userId}`), {
-    method: "GET",
-    headers: {
-      Accept: "application/json",
-    },
-  }).then((response) => response.json());
-  const solvedPuzzle = await solvePuzzle(registrationResponse);
-  if (!solvedPuzzle.solution) {
-    await register();
-    return;
-  }
-  const result = await fetch(getApiEndpoint(`/puzzle/registration?userId=${userId}`), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(solvedPuzzle),
-  }).then((response) => response.json());
-  if (result === true) {
-    return api.storage.sync.set({ registrationConfirmed: true });
-  }
-}
-
-api.storage.sync.get(null, async (res) => {
-  if (!res || !res.userId || !res.registrationConfirmed) {
-    await register();
-  }
-});
-
 const sentIds = new Set();
 let toSend = [];
-
-function countLeadingZeroes(uInt8View, limit) {
-  let zeroes = 0;
-  let value = 0;
-  for (let i = 0; i < uInt8View.length; i++) {
-    value = uInt8View[i];
-    if (value === 0) {
-      zeroes += 8;
-    } else {
-      let count = 1;
-      if (value >>> 4 === 0) {
-        count += 4;
-        value <<= 4;
-      }
-      if (value >>> 6 === 0) {
-        count += 2;
-        value <<= 2;
-      }
-      zeroes += count - (value >>> 7);
-      break;
-    }
-    if (zeroes >= limit) {
-      break;
-    }
-  }
-  return zeroes;
-}
-
-async function solvePuzzle(puzzle) {
-  let challenge = Uint8Array.from(atob(puzzle.challenge), (c) => c.charCodeAt(0));
-  let buffer = new ArrayBuffer(20);
-  let uInt8View = new Uint8Array(buffer);
-  let uInt32View = new Uint32Array(buffer);
-  let maxCount = Math.pow(2, puzzle.difficulty) * 3;
-  for (let i = 4; i < 20; i++) {
-    uInt8View[i] = challenge[i - 4];
-  }
-
-  for (let i = 0; i < maxCount; i++) {
-    uInt32View[0] = i;
-    let hash = await crypto.subtle.digest("SHA-512", buffer);
-    let hashUint8 = new Uint8Array(hash);
-    if (countLeadingZeroes(hashUint8) >= puzzle.difficulty) {
-      return {
-        solution: btoa(String.fromCharCode.apply(null, uInt8View.slice(0, 4))),
-      };
-    }
-  }
-  return {};
-}
-
-function generateUserID(length = 36) {
-  const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  let result = "";
-  if (crypto && crypto.getRandomValues) {
-    const values = new Uint32Array(length);
-    crypto.getRandomValues(values);
-    for (let i = 0; i < length; i++) {
-      result += charset[values[i] % charset.length];
-    }
-    return result;
-  } else {
-    for (let i = 0; i < length; i++) {
-      result += charset[Math.floor(Math.random() * charset.length)];
-    }
-    return result;
-  }
-}
 
 function storageChangeHandler(changes, area) {
   if (changes.disableVoteSubmission !== undefined) {

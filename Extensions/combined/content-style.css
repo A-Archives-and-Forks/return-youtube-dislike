@@ -19,7 +19,12 @@
 } */
 
 #ryd-bar-container {
-  background: var(--yt-spec-icon-disabled);
+  background: #737373;
+  background: color-mix(
+    in srgb,
+    var(--yt-spec-text-primary, #f1f1f1) 55%,
+    var(--yt-spec-base-background, #0f0f0f) 45%
+  );
   border-radius: 2px;
 }
 
