@@ -11,9 +11,13 @@ const LIVE_RUNTIME_PROFILES = deepFreeze({
     capabilities: {
       backgroundVoteTransport: true,
       credentialStore: "browser.storage",
-      ownsShortsDislikeControl: false,
-      shortsControlModel: "native-youtube",
-      shortsVisualModel: "native-pair",
+      ownsShortsDislikeControl: true,
+      shortsControlModel: "synthetic-owned",
+      shortsControlModelBySurface: {
+        desktop: "synthetic-owned",
+        mobile: "native-youtube-required",
+      },
+      shortsVisualModel: "strict-synthetic",
     },
     buildMarkerAttribute: "data-ryd-extension-build",
     markerAttribute: "data-ryd-extension-version",
@@ -21,7 +25,7 @@ const LIVE_RUNTIME_PROFILES = deepFreeze({
     selectors: {
       rateBar: "#ryd-bar",
       rateBarContainer: "#ryd-bar-container",
-      shortsDislikeControl: null,
+      shortsDislikeControl: "[data-ryd-synthetic-shorts-dislike]",
       tooltipContent: "#ryd-dislike-tooltip",
       tooltipTrigger: ".ryd-tooltip",
     },
@@ -32,6 +36,10 @@ const LIVE_RUNTIME_PROFILES = deepFreeze({
       credentialStore: "gm-storage",
       ownsShortsDislikeControl: true,
       shortsControlModel: "synthetic-owned",
+      shortsControlModelBySurface: {
+        desktop: "synthetic-owned",
+        mobile: "native-youtube-required",
+      },
       shortsVisualModel: "strict-synthetic",
     },
     buildMarkerAttribute: "data-ryd-userscript-build",
@@ -58,7 +66,7 @@ function assertRuntimeArgument(value, expected, label) {
   assert.equal(value, expected, `${label} does not match the selected live runtime adapter.`);
 }
 
-function createRuntimeBoundDriver(driver, runtime, expectedVersion, expectedBuildId) {
+function createRuntimeBoundDriver(driver, runtime, expectedVersion, expectedBuildId, capabilities) {
   return new Proxy(driver, {
     get(target, property, receiver) {
       if (property === "assertRuntime") {
@@ -72,10 +80,46 @@ function createRuntimeBoundDriver(driver, runtime, expectedVersion, expectedBuil
       }
 
       if (property === "assertCurrentShortsControl") {
-        return (videoId, requestedRuntime) => {
+        return (videoId, requestedRuntime, assertionOptions) => {
           assertRuntimeArgument(requestedRuntime, runtime, "The Shorts-control runtime");
           requireDriverMethod(target, "assertCurrentShortsControl");
-          return target.assertCurrentShortsControl(videoId, runtime);
+          return assertionOptions === undefined
+            ? target.assertCurrentShortsControl(videoId, runtime)
+            : target.assertCurrentShortsControl(videoId, runtime, assertionOptions);
+        };
+      }
+
+      if (property === "soakCurrentShortsControl") {
+        return (videoId, requestedRuntime, expectedDislikes, soakOptions) => {
+          assertRuntimeArgument(requestedRuntime, runtime, "The Shorts-control soak runtime");
+          requireDriverMethod(target, "soakCurrentShortsControl");
+          return target.soakCurrentShortsControl(videoId, runtime, expectedDislikes, soakOptions);
+        };
+      }
+
+      if (property === "assertCurrentWatchResult") {
+        return (videoId, requestedRuntime, expectedCounts, assertionOptions) => {
+          assertRuntimeArgument(requestedRuntime, runtime, "The Watch-result runtime");
+          requireDriverMethod(target, "assertCurrentWatchResult");
+          return assertionOptions === undefined
+            ? target.assertCurrentWatchResult(videoId, runtime, expectedCounts)
+            : target.assertCurrentWatchResult(videoId, runtime, expectedCounts, assertionOptions);
+        };
+      }
+
+      if (property === "assertRenderedDislikeCount") {
+        return (renderedCount, dislikes, requestedRuntime) => {
+          assertRuntimeArgument(requestedRuntime, runtime, "The rendered-count runtime");
+          requireDriverMethod(target, "assertRenderedDislikeCount");
+          return target.assertRenderedDislikeCount(renderedCount, dislikes, runtime);
+        };
+      }
+
+      if (property === "assertDislikeCountChangesObservable") {
+        return (changes, requestedRuntime) => {
+          assertRuntimeArgument(requestedRuntime, runtime, "The reaction count-observability runtime");
+          requireDriverMethod(target, "assertDislikeCountChangesObservable");
+          return target.assertDislikeCountChangesObservable(changes, runtime);
         };
       }
 
@@ -92,8 +136,17 @@ function createRuntimeBoundDriver(driver, runtime, expectedVersion, expectedBuil
       if (property === "captureReactionStateVisual") {
         return (request) => {
           assertRuntimeArgument(request?.runtime, runtime, "The reaction-visual runtime");
+          assertRuntimeArgument(
+            request?.shortsVisualModel,
+            capabilities.shortsVisualModel,
+            "The reaction-visual Shorts model",
+          );
           requireDriverMethod(target, "captureReactionStateVisual");
-          return target.captureReactionStateVisual({ ...request, runtime });
+          return target.captureReactionStateVisual({
+            ...request,
+            runtime,
+            shortsVisualModel: capabilities.shortsVisualModel,
+          });
         };
       }
 
@@ -117,8 +170,12 @@ class LiveRuntimeAdapter {
       throw new TypeError("The expected live build ID must be a 32-character lowercase hexadecimal value.");
     }
 
+    if (typeof driver.configureRequestAttributionRuntime === "function") {
+      driver.configureRequestAttributionRuntime(runtime);
+    }
+
     this.capabilities = profile.capabilities;
-    this.driver = createRuntimeBoundDriver(driver, runtime, expectedVersion, expectedBuildId);
+    this.driver = createRuntimeBoundDriver(driver, runtime, expectedVersion, expectedBuildId, this.capabilities);
     this.expectedBuildId = expectedBuildId;
     this.expectedVersion = expectedVersion;
     this.profile = profile;
@@ -135,6 +192,7 @@ class LiveRuntimeAdapter {
     assertRuntimeArgument(options.expectedVersion, this.expectedVersion, "The configured scenario runtime version");
     return {
       ...options,
+      capabilities: this.capabilities,
       expectedBuildId: this.expectedBuildId,
       expectedVersion: this.expectedVersion,
       runtime: this.runtime,

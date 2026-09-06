@@ -4,9 +4,26 @@ const path = require("path");
 const vm = require("vm");
 const webpack = require("webpack");
 const createUserscriptConfig = require("../../webpack.userscript.config");
+const {
+  USERSCRIPT_BUILD_RECEIPT_RELATIVE_PATH,
+  USERSCRIPT_LIVE_BUILD_RECEIPT_RELATIVE_PATH,
+} = require("../../userscript-build-receipt");
 const userscriptMeta = require("./userscript.meta");
 
 const ARTIFACT_PATH = path.join(__dirname, "Return Youtube Dislike.user.js");
+const REPOSITORY_ROOT = path.resolve(__dirname, "../..");
+
+function snapshotFile(filePath) {
+  return fs.existsSync(filePath) ? fs.readFileSync(filePath) : null;
+}
+
+function expectFileUnchanged(filePath, before) {
+  if (before === null) {
+    expect(fs.existsSync(filePath)).toBe(false);
+    return;
+  }
+  expect(fs.readFileSync(filePath)).toEqual(before);
+}
 
 function compile(config) {
   return new Promise((resolve, reject) => {
@@ -51,6 +68,7 @@ describe("generated userscript artifact", () => {
   it("is a standalone syntactically valid script with editable user options", () => {
     expect(() => new vm.Script(artifact, { filename: ARTIFACT_PATH })).not.toThrow();
     expect(artifact).not.toMatch(/^\s*(?:import|export)\s/m);
+    expect(artifact).not.toMatch(/[ \t]+(?=\r?\n|$)/);
     expect(artifact).toContain("BEGIN USER OPTIONS");
     expect(artifact).toContain("disableVoteSubmission: false");
     expect(artifact).not.toContain("data-ryd-userscript-version");
@@ -58,6 +76,8 @@ describe("generated userscript artifact", () => {
 
   it("builds an unpublished live-test artifact with a runtime marker and no update URLs", async () => {
     const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "ryd-userscript-live-build-"));
+    const receiptPath = path.join(REPOSITORY_ROOT, USERSCRIPT_LIVE_BUILD_RECEIPT_RELATIVE_PATH);
+    const receiptBefore = snapshotFile(receiptPath);
     try {
       const config = createUserscriptConfig({ liveTest: "true" }, { mode: "production" });
       config.output = { ...config.output, path: temporaryDirectory };
@@ -67,13 +87,17 @@ describe("generated userscript artifact", () => {
       expect(liveArtifact).toContain("// @name         Return YouTube Dislike [Live Test]");
       expect(liveArtifact).not.toContain("// @downloadURL");
       expect(liveArtifact).not.toContain("// @updateURL");
+      expect(liveArtifact).not.toMatch(/[ \t]+(?=\r?\n|$)/);
     } finally {
+      expectFileUnchanged(receiptPath, receiptBefore);
       fs.rmSync(temporaryDirectory, { recursive: true, force: true });
     }
   });
 
   it("rebuilds deterministically", async () => {
     const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "ryd-userscript-build-"));
+    const receiptPath = path.join(REPOSITORY_ROOT, USERSCRIPT_BUILD_RECEIPT_RELATIVE_PATH);
+    const receiptBefore = snapshotFile(receiptPath);
     try {
       const config = createUserscriptConfig({}, { mode: "production" });
       config.output = { ...config.output, path: temporaryDirectory };
@@ -81,6 +105,7 @@ describe("generated userscript artifact", () => {
       const rebuilt = fs.readFileSync(path.join(temporaryDirectory, config.output.filename), "utf8");
       expect(rebuilt).toBe(artifact);
     } finally {
+      expectFileUnchanged(receiptPath, receiptBefore);
       fs.rmSync(temporaryDirectory, { recursive: true, force: true });
     }
   });

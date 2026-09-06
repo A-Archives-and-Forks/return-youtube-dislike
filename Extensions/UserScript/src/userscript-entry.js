@@ -1,4 +1,14 @@
 import { createVoteClient } from "../../common/vote-client";
+import { resolveDelegatedVoteActivation } from "../../common/delegated-vote-activation";
+import {
+  actionBarHasHydratedData,
+  captureShortsNativeControlInventory,
+  getShortsControlSurfaceStabilityMs,
+  getShortsIdentityLinkVideoIds,
+  isShortsControlSurfaceReadyForMutation as sharedShortsSurfaceIsReady,
+  shortsNativeControlInventoryIsReadyForFallback as sharedShortsNativeInventoryIsReadyForFallback,
+  shortsNativeControlInventoryMatches,
+} from "../../common/shorts-control-readiness";
 import {
   LIKED_STATE,
   DISLIKED_STATE,
@@ -58,7 +68,6 @@ function getShortVideoIdFromPathname(pathname) {
 let isShorts = () => getShortVideoIdFromPathname(location.pathname) !== null;
 let mobileDislikes = 0;
 let suppressNextLikeActivation = false;
-const boundLikeButtons = new WeakSet();
 const boundDislikeButtons = new WeakSet();
 const boundActivationVideoIds = new WeakMap();
 const suppressedStaleRefreshTargets = new WeakSet();
@@ -71,6 +80,7 @@ let shortsLifecycleObserver = null;
 let shortsLifecycleObserverTarget = null;
 let initializationGeneration = 0;
 let initializationTimer = null;
+let pendingShortsMutationSurface = null;
 let activeCountRequest = null;
 let countStateVideoId = null;
 let countStateLoaded = false;
@@ -115,6 +125,16 @@ function intersectsViewport(element) {
   );
 }
 
+function hasMeaningfulViewportPresence(element) {
+  const rect = element?.getBoundingClientRect?.();
+  if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+  const height = innerHeight || document.documentElement.clientHeight;
+  const width = innerWidth || document.documentElement.clientWidth;
+  const visibleWidth = Math.max(0, Math.min(rect.right, width) - Math.max(rect.left, 0));
+  const visibleHeight = Math.max(0, Math.min(rect.bottom, height) - Math.max(rect.top, 0));
+  return (visibleWidth * visibleHeight) / (rect.width * rect.height) >= 0.5;
+}
+
 function hasRenderedBox(element) {
   if (!element?.isConnected || element.closest("[hidden], [aria-hidden='true'], [inert]")) {
     return false;
@@ -136,26 +156,22 @@ function hasRenderedBox(element) {
 
 function getRendererShortVideoIds(renderer) {
   const identities = new Set();
+  if (!renderer) {
+    return identities;
+  }
   const attributeVideoId = renderer.getAttribute("video-id");
   if (attributeVideoId) {
     identities.add(attributeVideoId);
-    return identities;
   }
-  for (const link of renderer.querySelectorAll('a[href*="/shorts/"]')) {
-    try {
-      const linkVideoId = getShortVideoIdFromPathname(new URL(link.getAttribute("href"), location.origin).pathname);
-      if (linkVideoId) {
-        identities.add(linkVideoId);
-      }
-    } catch {
-      // Ignore malformed or incomplete links while YouTube hydrates the reel.
-    }
+  for (const linkVideoId of getShortsIdentityLinkVideoIds(renderer, location.href)) {
+    identities.add(linkVideoId);
   }
   return identities;
 }
 
 function rendererMatchesShort(renderer, videoId) {
-  return Boolean(videoId) && getRendererShortVideoIds(renderer).has(videoId);
+  const videoIds = getRendererShortVideoIds(renderer);
+  return Boolean(videoId) && videoIds.size === 1 && videoIds.has(videoId);
 }
 
 function getControlOwnershipVideoIds(container) {
@@ -438,9 +454,9 @@ function getActiveDesktopShortsActionBar() {
     }))
     .filter(({ actionBar }) => actionBar);
 
-  const matchingCandidate = candidates.find(({ renderer }) => rendererMatchesShort(renderer, videoId));
-  if (matchingCandidate) {
-    return matchingCandidate.actionBar;
+  const matchingCandidates = candidates.filter(({ renderer }) => rendererMatchesShort(renderer, videoId));
+  if (matchingCandidates.length === 1) {
+    return matchingCandidates[0].actionBar;
   }
 
   // During channel/watch -> Shorts SPA transitions, YouTube can render the active
@@ -462,6 +478,47 @@ function getActiveDesktopShortsActionBar() {
       !hasConflictingControlOwnership(actionBar, videoId),
   );
   return fullyVisibleCandidates.length === 1 ? fullyVisibleCandidates[0].actionBar : null;
+}
+
+function getShortsControlSurfaceSignature(buttons) {
+  return (
+    Array.from(getRendererShortVideoIds(buttons?.closest("ytd-reel-video-renderer")))
+      .sort()
+      .join("|") || "identityless"
+  );
+}
+
+function getVisibleDesktopShortsControlSurfaceCount() {
+  return Array.from(document.querySelectorAll("reel-action-bar-view-model")).filter(
+    (candidate) => hasRenderedBox(candidate) && hasMeaningfulViewportPresence(candidate),
+  ).length;
+}
+
+function shortsControlSurfaceIsReadyForMutation(
+  buttons,
+  currentVideoId,
+  { allowUnhydratedFallback = false, isHydrated = false, isStable = false } = {},
+) {
+  return sharedShortsSurfaceIsReady({
+    allowUnhydratedFallback,
+    candidateVideoIds: getRendererShortVideoIds(buttons?.closest("ytd-reel-video-renderer")),
+    currentVideoId,
+    isConnected: buttons?.isConnected,
+    isHydrated,
+    isRendered: hasRenderedBox(buttons),
+    isStable,
+    isViewportIntersecting: hasMeaningfulViewportPresence(buttons),
+    visibleCandidateCount: getVisibleDesktopShortsControlSurfaceCount(),
+  });
+}
+
+function shortsNativeControlInventoryIsReadyForFallback(inventory) {
+  return sharedShortsNativeInventoryIsReadyForFallback(inventory, {
+    getTopmostElement:
+      typeof document.elementFromPoint === "function" ? (x, y) => document.elementFromPoint(x, y) : null,
+    isMeaningfullyInViewport: hasMeaningfulViewportPresence,
+    isRendered: hasRenderedBox,
+  });
 }
 
 function getActiveMobileShortsButtons() {
@@ -486,18 +543,7 @@ function getActiveMobileShortsButtons() {
 }
 
 function getExactShortLinkVideoIds(element) {
-  const identities = new Set();
-  for (const link of element.querySelectorAll('a[href*="/shorts/"]')) {
-    try {
-      const linkVideoId = getShortVideoIdFromPathname(new URL(link.getAttribute("href"), location.origin).pathname);
-      if (linkVideoId) {
-        identities.add(linkVideoId);
-      }
-    } catch {
-      // Ignore malformed or incomplete links while YouTube hydrates the reel.
-    }
-  }
-  return identities;
+  return getShortsIdentityLinkVideoIds(element, location.href);
 }
 
 function getMobileShortOwnership(buttons) {
@@ -629,19 +675,32 @@ function removeSyntheticShortsDislike(syntheticDislike) {
   }
 }
 
-function ensureSyntheticShortsDislikeButton(buttons) {
+function ensureSyntheticShortsDislikeButton(
+  buttons,
+  { allowUnhydratedFallback = false, currentVideoId = getVideoId(), isHydrated = false, isStable = false } = {},
+) {
   if (!isShorts() || isMobile || !buttons) {
     return;
   }
 
-  const syntheticDislike = buttons.querySelector(SYNTHETIC_SHORTS_DISLIKE_SELECTOR);
+  const syntheticDislikes = Array.from(buttons.querySelectorAll(SYNTHETIC_SHORTS_DISLIKE_SELECTOR));
+  const syntheticDislike = syntheticDislikes[0];
   const nativeDislike = buttons.querySelector("dislike-button-view-model, #dislike-button");
+  const readyForMutation = shortsControlSurfaceIsReadyForMutation(buttons, currentVideoId, {
+    allowUnhydratedFallback,
+    isHydrated: isHydrated && actionBarHasHydratedData(buttons),
+    isStable,
+  });
   if (nativeDislike) {
-    removeSyntheticShortsDislike(syntheticDislike);
+    if (readyForMutation) syntheticDislikes.forEach(removeSyntheticShortsDislike);
+    return;
+  }
+  if (!readyForMutation) {
     return;
   }
   if (syntheticDislike) {
-    const videoId = getVideoId();
+    syntheticDislikes.slice(1).forEach(removeSyntheticShortsDislike);
+    const videoId = currentVideoId;
     if (videoId && syntheticDislike.getAttribute("data-ryd-video-id") !== videoId) {
       syntheticDislike.setAttribute("data-ryd-video-id", videoId);
       setSyntheticShortsPressed(false, syntheticDislike);
@@ -715,9 +774,7 @@ function ensureSyntheticShortsDislikeButton(buttons) {
   likeButton.insertAdjacentElement("afterend", ownedDislike);
 }
 
-function getDislikeButton() {
-  const buttons = getButtons();
-  ensureSyntheticShortsDislikeButton(buttons);
+function getDislikeButton(buttons = getButtons()) {
   if (buttons?.tagName === "REEL-ACTION-BAR-VIEW-MODEL") {
     return (
       buttons.querySelector("dislike-button-view-model, #dislike-button") ??
@@ -746,8 +803,7 @@ function getDislikeButton() {
   }
 }
 
-function getLikeButton() {
-  const buttons = getButtons();
+function getLikeButton(buttons = getButtons()) {
   const firstButton = buttons?.children?.[0];
   if (!firstButton) {
     return null;
@@ -768,18 +824,27 @@ function getLikeTextContainer() {
   );
 }
 
-function getDislikeTextContainer() {
-  const dislikeButton = getDislikeButton();
+function getDislikeTextContainer(dislikeButton = getDislikeButton()) {
+  if (!dislikeButton) {
+    return null;
+  }
+
   let result =
-    dislikeButton?.querySelector("#text") ??
-    dislikeButton?.getElementsByTagName("yt-formatted-string")[0] ??
-    dislikeButton?.querySelector("span[role='text']");
-  if (result === null) {
-    let textSpan = document.createElement("span");
+    dislikeButton.querySelector("#text") ??
+    dislikeButton.getElementsByTagName("yt-formatted-string")[0] ??
+    dislikeButton.querySelector("span[role='text']");
+  if (result == null) {
+    const activationTarget = getActivationTarget(dislikeButton);
+    if (!activationTarget?.matches("button, tp-yt-paper-button#button")) {
+      return null;
+    }
+
+    const textSpan = document.createElement("span");
     textSpan.id = "text";
+    textSpan.setAttribute("role", "text");
     textSpan.style.marginLeft = "6px";
-    dislikeButton?.querySelector("button").appendChild(textSpan);
-    if (dislikeButton) dislikeButton.querySelector("button").style.width = "auto";
+    activationTarget.appendChild(textSpan);
+    activationTarget.style.width = "auto";
     result = textSpan;
   }
   return result;
@@ -833,6 +898,9 @@ function createObserver(options, callback) {
   };
   observerWrapper.disconnect = function () {
     this.observer.disconnect();
+  };
+  observerWrapper.takeRecords = function () {
+    return this.observer.takeRecords();
   };
   return observerWrapper;
 }
@@ -1293,11 +1361,7 @@ function removeWatchRateBarArtifacts(buttons) {
   }
 }
 
-function clearStaleWatchPresentation(buttons, dislikeButton, videoId) {
-  if (isMobile || isShorts() || !initializedVideoId || initializedVideoId === videoId) {
-    return;
-  }
-
+function clearWatchPresentation(buttons, dislikeButton) {
   removeWatchRateBarArtifacts(buttons);
   const dislikeText =
     dislikeButton?.querySelector("#text") ??
@@ -1306,6 +1370,14 @@ function clearStaleWatchPresentation(buttons, dislikeButton, videoId) {
   if (dislikeText) {
     dislikeText.textContent = "";
   }
+}
+
+function clearStaleWatchPresentation(buttons, dislikeButton, videoId) {
+  if (isMobile || isShorts() || !initializedVideoId || initializedVideoId === videoId) {
+    return;
+  }
+
+  clearWatchPresentation(buttons, dislikeButton);
 }
 
 function canRepairWatchRateBar(buttons, videoId) {
@@ -1465,8 +1537,14 @@ function setState() {
 }
 
 function updateDOMDislikes() {
+  const videoId = getVideoId();
+  if (!videoId || !countStateLoaded || countStateVideoId !== videoId) {
+    return false;
+  }
+
   setDislikes(numberFormat(dislikesvalue));
   createRateBar(likesvalue, dislikesvalue);
+  return true;
 }
 
 function reportVoteFailure(error) {
@@ -1649,6 +1727,49 @@ function dislikeClicked(event) {
     return;
   }
   handleVoteActivation(DISLIKE_ACTION);
+}
+
+function handleDelegatedVoteClick(event) {
+  const buttons = getButtons();
+  const likeButton = getLikeButton(buttons);
+  const dislikeButton = getDislikeButton(buttons);
+  const activation = resolveDelegatedVoteActivation({
+    buttons,
+    dislikeButton,
+    event,
+    getActivationTarget,
+    likeButton,
+  });
+  if (!activation) {
+    return;
+  }
+
+  const videoId = getVideoId();
+  if (!videoId) {
+    return;
+  }
+  const targetHydration = hydratingShortsActivationTargets.get(activation.activationTarget);
+  const hydration = targetHydration?.videoId === videoId ? targetHydration : null;
+  if (targetHydration && !hydration) {
+    hydratingShortsActivationTargets.delete(activation.activationTarget);
+  }
+  const targetIsBoundToCurrentVideo = boundActivationVideoIds.get(activation.activationTarget) === videoId;
+  const currentCountStateIsLoaded = countStateLoaded && countStateVideoId === videoId;
+  const isUnboundCurrentShortsActivation = isShorts() && !hydration && !targetIsBoundToCurrentVideo;
+  if (!hydration && !targetIsBoundToCurrentVideo && !currentCountStateIsLoaded && !isUnboundCurrentShortsActivation) {
+    return;
+  }
+
+  if (isUnboundCurrentShortsActivation) {
+    previousState = getState();
+  }
+  boundActivationVideoIds.set(activation.activationTarget, videoId);
+  const delegatedEvent = { currentTarget: activation.activationTarget };
+  if (activation.action === LIKE_ACTION) {
+    likeClicked(delegatedEvent);
+  } else {
+    dislikeClicked(delegatedEvent);
+  }
 }
 
 function refreshDislikesForBoundControl(event) {
@@ -1862,7 +1983,12 @@ function shortsControlsNeedInitialization() {
   const buttons = getButtons();
   const likeButton = getLikeButton();
   const dislikeButton = getDislikeButton();
+  const syntheticDislikes = buttons?.querySelectorAll?.(SYNTHETIC_SHORTS_DISLIKE_SELECTOR).length ?? 0;
+  const hasNativeDislike = Boolean(buttons?.querySelector?.("dislike-button-view-model, #dislike-button"));
   if (!buttons || !likeButton || !dislikeButton) {
+    return true;
+  }
+  if ((hasNativeDislike && syntheticDislikes > 0) || (!hasNativeDislike && syntheticDislikes !== 1)) {
     return true;
   }
   if (
@@ -2016,12 +2142,7 @@ function bindVoteButtonListeners(likeButton, dislikeButton, { enableSynthetic = 
   const videoId = getVideoId();
   boundActivationVideoIds.set(likeActivationTarget, videoId);
   boundActivationVideoIds.set(dislikeActivationTarget, videoId);
-  if (!boundLikeButtons.has(likeActivationTarget)) {
-    likeActivationTarget.addEventListener("click", likeClicked);
-    boundLikeButtons.add(likeActivationTarget);
-  }
   if (!boundDislikeButtons.has(dislikeActivationTarget)) {
-    dislikeActivationTarget.addEventListener("click", dislikeClicked);
     dislikeActivationTarget.addEventListener("focusin", refreshDislikesForBoundControl);
     dislikeActivationTarget.addEventListener("focusout", refreshDislikesForBoundControl);
     boundDislikeButtons.add(dislikeActivationTarget);
@@ -2030,6 +2151,106 @@ function bindVoteButtonListeners(likeButton, dislikeButton, { enableSynthetic = 
     dislikeActivationTarget.disabled = false;
     dislikeActivationTarget.setAttribute("aria-disabled", "false");
   }
+}
+
+function getStableDesktopShortsControls(videoId, generation) {
+  const buttons = getButtons();
+  const inventory = captureShortsNativeControlInventory(buttons);
+  const isHydrated = actionBarHasHydratedData(buttons);
+  if (
+    !buttons ||
+    !inventory ||
+    (!isHydrated && !shortsNativeControlInventoryIsReadyForFallback(inventory)) ||
+    !shortsControlSurfaceIsReadyForMutation(buttons, videoId, {
+      allowUnhydratedFallback: !isHydrated,
+      isHydrated,
+      isStable: true,
+    })
+  ) {
+    pendingShortsMutationSurface = null;
+    return null;
+  }
+
+  const signature = getShortsControlSurfaceSignature(buttons);
+  const now = performance.now();
+  if (
+    pendingShortsMutationSurface?.buttons !== buttons ||
+    pendingShortsMutationSurface.generation !== generation ||
+    pendingShortsMutationSurface.videoId !== videoId ||
+    pendingShortsMutationSurface.signature !== signature ||
+    !shortsNativeControlInventoryMatches(pendingShortsMutationSurface.inventory, inventory)
+  ) {
+    pendingShortsMutationSurface = {
+      buttons,
+      generation,
+      inventory,
+      observedAt: now,
+      signature,
+      unhydratedObservedAt: isHydrated ? null : now,
+      videoId,
+    };
+    return null;
+  }
+
+  if (isHydrated) {
+    pendingShortsMutationSurface.unhydratedObservedAt = null;
+  } else if (pendingShortsMutationSurface.unhydratedObservedAt == null) {
+    pendingShortsMutationSurface.unhydratedObservedAt = now;
+  }
+  const stabilityObservedAt = isHydrated
+    ? pendingShortsMutationSurface.observedAt
+    : pendingShortsMutationSurface.unhydratedObservedAt;
+  if (now - stabilityObservedAt < getShortsControlSurfaceStabilityMs(isHydrated)) {
+    return null;
+  }
+
+  const allowUnhydratedFallback = !isHydrated;
+  const preMutationButtons = getButtons();
+  const preMutationInventory = captureShortsNativeControlInventory(preMutationButtons);
+  const preMutationIsHydrated = actionBarHasHydratedData(preMutationButtons);
+  const preMutationAllowsFallback = !preMutationIsHydrated && allowUnhydratedFallback;
+  if (
+    preMutationButtons !== buttons ||
+    !shortsNativeControlInventoryMatches(inventory, preMutationInventory) ||
+    (preMutationAllowsFallback && !shortsNativeControlInventoryIsReadyForFallback(preMutationInventory)) ||
+    getShortsControlSurfaceSignature(preMutationButtons) !== signature ||
+    !shortsControlSurfaceIsReadyForMutation(preMutationButtons, videoId, {
+      allowUnhydratedFallback: preMutationAllowsFallback,
+      isHydrated: preMutationIsHydrated,
+      isStable: true,
+    })
+  ) {
+    pendingShortsMutationSurface = null;
+    return null;
+  }
+
+  ensureSyntheticShortsDislikeButton(preMutationButtons, {
+    allowUnhydratedFallback: preMutationAllowsFallback,
+    currentVideoId: videoId,
+    isHydrated: preMutationIsHydrated,
+    isStable: true,
+  });
+
+  const confirmedButtons = getButtons();
+  const confirmedInventory = captureShortsNativeControlInventory(confirmedButtons);
+  const confirmedIsHydrated = actionBarHasHydratedData(confirmedButtons);
+  if (
+    confirmedButtons !== buttons ||
+    !shortsNativeControlInventoryMatches(inventory, confirmedInventory) ||
+    (preMutationAllowsFallback && !shortsNativeControlInventoryIsReadyForFallback(confirmedInventory)) ||
+    getShortsControlSurfaceSignature(confirmedButtons) !== signature ||
+    !shortsControlSurfaceIsReadyForMutation(confirmedButtons, videoId, {
+      allowUnhydratedFallback: !confirmedIsHydrated && preMutationAllowsFallback,
+      isHydrated: confirmedIsHydrated,
+      isStable: true,
+    })
+  ) {
+    pendingShortsMutationSurface = null;
+    return null;
+  }
+
+  pendingShortsMutationSurface = null;
+  return confirmedButtons;
 }
 
 async function initializeCurrentButtons(generation) {
@@ -2045,13 +2266,29 @@ async function initializeCurrentButtons(generation) {
     return false;
   }
 
-  const buttons = getButtons();
-  const likeButton = getLikeButton();
-  const dislikeButton = getDislikeButton();
+  let buttons = getButtons();
+  const needsStableShortsControls =
+    isShorts() &&
+    !isMobile &&
+    buttons?.tagName === "REEL-ACTION-BAR-VIEW-MODEL" &&
+    (!buttons.querySelector("dislike-button-view-model, #dislike-button") ||
+      buttons.querySelector(SYNTHETIC_SHORTS_DISLIKE_SELECTOR) ||
+      !actionBarHasHydratedData(buttons));
+  if (needsStableShortsControls) {
+    buttons = getStableDesktopShortsControls(videoId, generation);
+    if (!buttons) {
+      return false;
+    }
+  }
+  const likeButton = getLikeButton(buttons);
+  const dislikeButton = getDislikeButton(buttons);
   if (!buttons || !likeButton || !dislikeButton) {
     return false;
   }
   if (!isShorts() && !watchControlsAreReadyForVideo(buttons, likeButton, dislikeButton, videoId)) {
+    return false;
+  }
+  if (!isShorts() && !getDislikeTextContainer(dislikeButton)) {
     return false;
   }
 
@@ -2238,7 +2475,13 @@ function checkPageLifecycle() {
 }
 
 function handleNavigateStart() {
+  pendingShortsMutationSurface = null;
   disconnectWatchRateBarObserver();
+  if (smartimationObserver) {
+    smartimationObserver.takeRecords();
+    smartimationObserver.disconnect();
+    smartimationObserver.container = null;
+  }
   clearPendingWatchNavigationBoundary();
   clearPendingWatchControlObservers();
   if (isShorts()) {
@@ -2265,6 +2508,11 @@ function handleNavigateStart() {
   ) {
     return;
   }
+
+  activeCountRequest = null;
+  countStateLoaded = false;
+  countStateEpoch += 1;
+  clearWatchPresentation(buttons, dislikeButton);
 
   const boundary = {
     buttons,
@@ -2317,6 +2565,7 @@ function handleNavigateFinish(event) {
 (function () {
   "use strict";
   void voteClient.ensureRegistered().catch(reportVoteFailure);
+  document.addEventListener("click", handleDelegatedVoteClick, true);
   window.addEventListener("yt-navigate-start", handleNavigateStart, true);
   window.addEventListener("yt-navigate-finish", handleNavigateFinish, true);
   window.addEventListener("popstate", checkPageLifecycle, true);

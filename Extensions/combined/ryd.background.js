@@ -1,6 +1,12 @@
 import { config, getApiUrl, getApiEndpoint, getChangelogUrl } from "./src/config";
 import { createVoteClient } from "../common/vote-client";
 import { createBrowserCredentialStore } from "./src/vote-client-adapter";
+import { loginWithGitHub } from "./src/github-auth";
+import {
+  hasAuthenticationDataPermission,
+  onAuthenticationDataPermissionRemoved,
+  usesFirefoxDataCollectionConsent,
+} from "./src/data-collection-permissions";
 
 const apiUrl = getApiUrl();
 const voteDisabledIconName = config.voteDisabledIconName;
@@ -11,9 +17,19 @@ const PENDING_CHANGELOG_STORAGE_KEY = "pendingChangelogVersion";
 
 /** stores extension's global config */
 let extConfig = { ...config.defaultExtConfig };
+let authenticationGeneration = 0;
+let accountStorageQueue = Promise.resolve();
 
 if (isChrome()) api = chrome;
 else if (isFirefox()) api = browser;
+
+if (__RYD_LIVE_TEST_BUILD__) {
+  globalThis.__RYD_LIVE_EXTENSION_BUILD__ = Object.freeze({
+    buildId: __RYD_LIVE_BUILD_ID__,
+    runtime: "extension",
+    version: api.runtime.getManifest().version,
+  });
+}
 
 const voteClient = createVoteClient({
   apiBaseUrl: apiUrl,
@@ -25,8 +41,9 @@ const voteClient = createVoteClient({
 initExtConfig();
 voteClient.ensureRegistered().catch((error) => console.error("Vote registration failed", error));
 
-function broadcastPatreonStatus(authenticated, user, sessionToken) {
+function broadcastPatreonStatus(authenticated, user, sessionToken, generation = authenticationGeneration) {
   chrome.tabs.query({}, (tabs) => {
+    if (generation !== authenticationGeneration) return;
     tabs
       .filter((tab) => tab.url && tab.url.includes("youtube.com"))
       .forEach((tab) => {
@@ -54,23 +71,83 @@ function broadcastPatreonStatus(authenticated, user, sessionToken) {
   });
 }
 
-function handlePatreonAuthComplete(user, sessionToken, done) {
-  if (!user) {
-    done?.();
+function handlePatreonAuthComplete(user, sessionToken, generation, done) {
+  if (!user || !sessionToken || generation !== authenticationGeneration) {
+    done?.(false);
     return;
   }
 
-  chrome.storage.sync.set(
-    {
-      patreonAuthenticated: true,
-      patreonUser: user,
-      patreonSessionToken: sessionToken,
-    },
-    () => {
-      broadcastPatreonStatus(true, user, sessionToken);
-      done?.();
-    },
+  if (usesFirefoxDataCollectionConsent()) {
+    hasAuthenticationDataPermission({ queryBackground: false }).then((granted) => {
+      if (granted && generation === authenticationGeneration) persistPatreonAuth(user, sessionToken, generation, done);
+      else done?.(false);
+    });
+    return;
+  }
+
+  persistPatreonAuth(user, sessionToken, generation, done);
+}
+
+function persistPatreonAuth(user, sessionToken, generation, done) {
+  queueAccountStorageMutation((complete) => {
+    if (generation !== authenticationGeneration) {
+      complete();
+      return;
+    }
+    chrome.storage.sync.set(
+      {
+        patreonAuthenticated: true,
+        patreonUser: user,
+        patreonSessionToken: sessionToken,
+      },
+      complete,
+    );
+  })
+    .then(() => {
+      if (generation !== authenticationGeneration) {
+        done?.(false);
+        return;
+      }
+      broadcastPatreonStatus(true, user, sessionToken, generation);
+      done?.(true);
+    })
+    .catch(() => done?.(false));
+}
+
+function queueAccountStorageMutation(operation) {
+  const pending = accountStorageQueue.then(
+    () =>
+      new Promise((resolve, reject) => {
+        operation(() => {
+          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+          else resolve();
+        });
+      }),
   );
+  accountStorageQueue = pending.catch(() => {});
+  return pending;
+}
+
+function clearPatreonAuth(done) {
+  const generation = ++authenticationGeneration;
+  broadcastPatreonStatus(false, null, null, generation);
+  queueAccountStorageMutation((complete) => {
+    chrome.storage.sync.remove(["patreonAuthenticated", "patreonUser", "patreonSessionToken"], complete);
+  })
+    .then(() => done?.())
+    .catch((error) => console.error("Account session cleanup failed", error));
+}
+
+onAuthenticationDataPermissionRemoved(() => clearPatreonAuth());
+
+async function requireCurrentAuthenticationConsent(generation) {
+  if (
+    generation !== authenticationGeneration ||
+    (usesFirefoxDataCollectionConsent() && !(await hasAuthenticationDataPermission({ queryBackground: false }))) ||
+    generation !== authenticationGeneration
+  ) {
+    throw new Error("authentication data consent removed or sign-in cancelled");
+  }
 }
 
 function getIdentityApi() {
@@ -115,22 +192,11 @@ function extractOAuthParams(responseUrl) {
 }
 
 api.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (request.message === "get_auth_token") {
-    chrome.identity.getAuthToken({ interactive: true }, function (token) {
-      console.log(token);
-      chrome.identity.getProfileUserInfo(function (userInfo) {
-        console.log(JSON.stringify(userInfo));
-      });
-    });
-  } else if (request.message === "log_off") {
-    // chrome.identity.clearAllCachedAuthTokens(() => console.log("logged off"));
-  } else if (request.message === "patreon_auth_complete") {
-    handlePatreonAuthComplete(request.user, request.sessionToken);
-  } else if (request.message === "patreon_logout") {
-    // Clear Patreon authentication
-    chrome.storage.sync.remove(["patreonAuthenticated", "patreonUser", "patreonSessionToken"], () => {
-      broadcastPatreonStatus(false, null, null);
-    });
+  if (request.message === "patreon_logout") {
+    clearPatreonAuth();
+  } else if (request.message === "ryd_has_authentication_consent") {
+    hasAuthenticationDataPermission({ queryBackground: false }).then((granted) => sendResponse({ granted }));
+    return true;
   } else if (request.message === "ryd_open_tab") {
     const targetUrl = typeof request?.url === "string" ? request.url : null;
     if (!targetUrl) {
@@ -197,8 +263,11 @@ api.runtime.onMessage.addListener((request, sender, sendResponse) => {
       .catch((error) => sendResponse?.({ success: false, error: error.message }));
     return true;
   } else if (request.message === "patreon_oauth_login") {
+    const generation = ++authenticationGeneration;
     (async () => {
       try {
+        await requireCurrentAuthenticationConsent(generation);
+
         const idApi = getIdentityApi();
         if (
           !idApi ||
@@ -220,12 +289,15 @@ api.runtime.onMessage.addListener((request, sender, sendResponse) => {
         );
         const startData = await startRes.json();
 
+        await requireCurrentAuthenticationConsent(generation);
         const responseUrl = await launchWebAuthFlow(startData.authUrl);
         const { code, state } = extractOAuthParams(responseUrl);
         if (!code) {
           sendResponse({ success: false, error: "No authorization code received" });
           return;
         }
+
+        await requireCurrentAuthenticationConsent(generation);
 
         const exchangeRes = await fetch(getApiEndpoint("/api/auth/oauth/exchange"), {
           method: "POST",
@@ -239,8 +311,12 @@ api.runtime.onMessage.addListener((request, sender, sendResponse) => {
         });
         const authData = await exchangeRes.json();
         if (authData && authData.success) {
-          handlePatreonAuthComplete(authData.user, authData.sessionToken, () => {
-            sendResponse({ success: true, user: authData.user });
+          handlePatreonAuthComplete(authData.user, authData.sessionToken, generation, (stored) => {
+            sendResponse(
+              stored
+                ? { success: true, user: authData.user }
+                : { success: false, error: "authentication data consent removed" },
+            );
           });
         } else {
           sendResponse({ success: false, error: (authData && authData.error) || "OAuth exchange failed" });
@@ -252,8 +328,11 @@ api.runtime.onMessage.addListener((request, sender, sendResponse) => {
     })();
     return true;
   } else if (request.message === "github_oauth_login") {
+    const generation = ++authenticationGeneration;
     (async () => {
       try {
+        await requireCurrentAuthenticationConsent(generation);
+
         const idApi = getIdentityApi();
         if (
           !idApi ||
@@ -271,32 +350,18 @@ api.runtime.onMessage.addListener((request, sender, sendResponse) => {
               ? chrome.identity.getRedirectURL()
               : "";
 
-        const startRes = await fetch(
-          getApiEndpoint(`/api/auth/github/login?redirectUri=${encodeURIComponent(redirectUri)}`),
-        );
-        const startData = await startRes.json();
-
-        const responseUrl = await launchWebAuthFlow(startData.authUrl);
-        const { code, state } = extractOAuthParams(responseUrl);
-        if (!code) {
-          sendResponse({ success: false, error: "No authorization code received" });
-          return;
-        }
-
-        const exchangeRes = await fetch(getApiEndpoint("/api/auth/github/exchange"), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            code,
-            state,
-            expectedState: startData.state,
-            redirectUri: startData.redirectUri || redirectUri,
-          }),
+        const authData = await loginWithGitHub({
+          redirectUri,
+          launchWebAuthFlow,
+          requireConsent: () => requireCurrentAuthenticationConsent(generation),
         });
-        const authData = await exchangeRes.json();
         if (authData && authData.success) {
-          handlePatreonAuthComplete(authData.user, authData.sessionToken, () => {
-            sendResponse({ success: true, user: authData.user });
+          handlePatreonAuthComplete(authData.user, authData.sessionToken, generation, (stored) => {
+            sendResponse(
+              stored
+                ? { success: true, user: authData.user }
+                : { success: false, error: "authentication data consent removed" },
+            );
           });
         } else {
           sendResponse({ success: false, error: (authData && authData.error) || "OAuth exchange failed" });
@@ -316,6 +381,7 @@ function openChangelogTab(version) {
     api.tabs.create({ url }, () => {
       if (api.runtime.lastError) {
         console.debug("Changelog tab could not open:", api.runtime.lastError.message);
+        return;
       }
       persistChangelogVersion(version);
     });
@@ -427,7 +493,8 @@ function maybeShowChangelog(details) {
   const manifest = api.runtime.getManifest();
   const currentVersion = manifest?.version;
   const storage = api?.storage?.local;
-  const isInstall = reason === "install";
+  // Temporary add-ons do not survive a browser restart, so their updates cannot wait for onStartup.
+  const showImmediately = reason === "install" || details.temporary === true;
 
   const showChangelog = () => {
     openChangelogTab(currentVersion || null);
@@ -450,7 +517,7 @@ function maybeShowChangelog(details) {
       const lastShownValue = result?.[CHANGELOG_STORAGE_KEY];
       const pendingValue = result?.[PENDING_CHANGELOG_STORAGE_KEY];
 
-      if (isInstall) {
+      if (showImmediately) {
         if (hasStoredValue(pendingValue)) {
           clearPendingChangelogVersion();
         }
@@ -536,6 +603,9 @@ function storageChangeHandler(changes, area) {
   if (changes.hidePremiumTeaser !== undefined) {
     handleHidePremiumTeaserChangeEvent(changes.hidePremiumTeaser.newValue);
   }
+  if (changes.hideClutterButtons !== undefined) {
+    handleHideClutterButtonsChangeEvent(changes.hideClutterButtons.newValue);
+  }
 }
 
 function handleDisableVoteSubmissionChangeEvent(value) {
@@ -595,6 +665,10 @@ function handleHidePremiumTeaserChangeEvent(value) {
   extConfig.hidePremiumTeaser = value === true;
 }
 
+function handleHideClutterButtonsChangeEvent(value) {
+  extConfig.hideClutterButtons = value === true;
+}
+
 api.storage.onChanged.addListener(storageChangeHandler);
 
 function initExtConfig() {
@@ -608,6 +682,7 @@ function initExtConfig() {
   initializeTooltipPercentage();
   initializeTooltipPercentageMode();
   initializeHidePremiumTeaser();
+  initializeHideClutterButtons();
 }
 
 function initializeDisableVoteSubmission() {
@@ -708,6 +783,17 @@ function initializeHidePremiumTeaser() {
       extConfig.hidePremiumTeaser = false;
     } else {
       extConfig.hidePremiumTeaser = res.hidePremiumTeaser === true;
+    }
+  });
+}
+
+function initializeHideClutterButtons() {
+  api.storage.sync.get(["hideClutterButtons"], (res) => {
+    if (res.hideClutterButtons === undefined) {
+      api.storage.sync.set({ hideClutterButtons: false });
+      extConfig.hideClutterButtons = false;
+    } else {
+      extConfig.hideClutterButtons = res.hideClutterButtons === true;
     }
   });
 }

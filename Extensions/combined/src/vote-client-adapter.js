@@ -65,4 +65,40 @@ function createBrowserCredentialStore(storageArea, getLastError) {
   };
 }
 
-export { createBrowserCredentialStore };
+const SYNTHETIC_DISLIKE_KEY_PREFIX = "rydSyntheticDislikedShort:";
+
+function syntheticDislikeKey(videoId) {
+  if (typeof videoId !== "string" || videoId.length === 0) {
+    throw new TypeError("videoId must be a non-empty string");
+  }
+  return `${SYNTHETIC_DISLIKE_KEY_PREFIX}${videoId}`;
+}
+
+function createBrowserSyntheticDislikeStore(storageArea, getLastError) {
+  if (!storageArea?.get || !storageArea?.set) {
+    throw new TypeError("A browser storage area is required");
+  }
+
+  const call = createStorageCaller(storageArea, getLastError);
+  return {
+    async isDisliked(videoId) {
+      const key = syntheticDislikeKey(videoId);
+      const result = await call("get", [key]);
+      return result?.[key] === true;
+    },
+
+    async setDisliked(videoId, disliked) {
+      const key = syntheticDislikeKey(videoId);
+      if (typeof disliked !== "boolean") {
+        throw new TypeError("disliked must be a boolean");
+      }
+      if (disliked || typeof storageArea.remove !== "function") {
+        await call("set", { [key]: disliked });
+      } else {
+        await call("remove", [key]);
+      }
+    },
+  };
+}
+
+export { SYNTHETIC_DISLIKE_KEY_PREFIX, createBrowserCredentialStore, createBrowserSyntheticDislikeStore };

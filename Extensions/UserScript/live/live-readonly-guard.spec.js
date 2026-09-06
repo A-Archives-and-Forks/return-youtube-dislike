@@ -6,6 +6,7 @@ class FakeBrowserContext {
     this.routes = [];
     this.routeCalls = 0;
     this.unrouteCalls = 0;
+    this.unrouteImplementation = null;
   }
 
   on(event, handler) {
@@ -25,6 +26,7 @@ class FakeBrowserContext {
   async unroute(matcher, handler) {
     this.unrouteCalls += 1;
     this.routes = this.routes.filter((route) => route.matcher !== matcher || route.handler !== handler);
+    if (this.unrouteImplementation) await this.unrouteImplementation();
   }
 
   async dispatch(request) {
@@ -45,12 +47,12 @@ class FakeBrowserContext {
   }
 }
 
-function createDriver(context) {
+function createDriver(context, options = {}) {
   const page = {
     setDefaultNavigationTimeout: jest.fn(),
     setDefaultTimeout: jest.fn(),
   };
-  return new LiveYoutubeDriver(page, context);
+  return new LiveYoutubeDriver(page, context, options);
 }
 
 function request(method, url) {
@@ -115,5 +117,60 @@ describe("live read-only production-interaction guard", () => {
     expect(context.routeCalls).toBe(1);
     expect(context.unrouteCalls).toBe(1);
     expect(context.routes).toEqual([]);
+  });
+
+  test("bounds a stalled route removal, clears the guard, and allows a fresh guard", async () => {
+    const context = new FakeBrowserContext();
+    const reportProgress = jest.fn();
+    const driver = createDriver(context, {
+      readOnlyInteractionGuardCleanupTimeout: 10,
+      reportProgress,
+    });
+    context.unrouteImplementation = () => new Promise(() => {});
+
+    await expect(driver.withNoProductionInteractions(async () => "first action complete")).rejects.toThrow(
+      "Timed out after 10ms while removing the live read-only production-interaction route.",
+    );
+
+    expect(driver.readOnlyInteractionGuard).toBeNull();
+    expect(context.listeners.get("request")?.size ?? 0).toBe(0);
+    expect(context.routes).toEqual([]);
+    expect(reportProgress).toHaveBeenCalledWith("read-only-interaction-guard.unroute-started", { timeoutMs: 10 });
+    expect(reportProgress).toHaveBeenCalledWith("read-only-interaction-guard.unroute-failed", {
+      message: "Timed out after 10ms while removing the live read-only production-interaction route.",
+      timeoutMs: 10,
+    });
+
+    context.unrouteImplementation = null;
+    await expect(driver.withNoProductionInteractions(async () => "second action complete")).resolves.toBe(
+      "second action complete",
+    );
+    expect(context.routeCalls).toBe(2);
+    expect(context.unrouteCalls).toBe(2);
+  });
+
+  test("preserves both the action failure and a stalled route-removal failure", async () => {
+    const context = new FakeBrowserContext();
+    const driver = createDriver(context, { readOnlyInteractionGuardCleanupTimeout: 10 });
+    const actionError = new Error("read-only action failed");
+    context.unrouteImplementation = () => new Promise(() => {});
+
+    const failure = await driver
+      .withNoProductionInteractions(async () => {
+        throw actionError;
+      })
+      .catch((error) => error);
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect(failure.message).toBe("The read-only live scenario and its production-interaction guard both failed.");
+    expect(failure.errors).toHaveLength(2);
+    expect(failure.errors[0]).toBe(actionError);
+    expect(failure.errors[1]).toEqual(
+      expect.objectContaining({
+        message: "Timed out after 10ms while removing the live read-only production-interaction route.",
+      }),
+    );
+    expect(driver.readOnlyInteractionGuard).toBeNull();
+    expect(context.listeners.get("request")?.size ?? 0).toBe(0);
   });
 });

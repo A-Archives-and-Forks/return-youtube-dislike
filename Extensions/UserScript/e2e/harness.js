@@ -1,10 +1,10 @@
 const fs = require("fs");
 const path = require("path");
+const { isAllowedApiPreflight } = require("../../e2e/hermetic-api-contract");
+const { resolveRequestedUserscriptArtifact } = require("../../e2e/verify-userscript-artifact");
 
 const REPOSITORY_ROOT = path.resolve(__dirname, "../../..");
-const GENERATED_USERSCRIPT =
-  process.env.RYD_USERSCRIPT_ARTIFACT ||
-  path.join(REPOSITORY_ROOT, "Extensions", "UserScript", "Return Youtube Dislike.user.js");
+const GENERATED_USERSCRIPT = resolveRequestedUserscriptArtifact();
 const WATCH_FIXTURE = fs.readFileSync(path.join(__dirname, "fixtures", "watch-page.html"), "utf8");
 const SHORTS_FIXTURE = fs.readFileSync(path.join(__dirname, "fixtures", "shorts-page.html"), "utf8");
 const NAVIGATION_FIXTURE = fs.readFileSync(path.join(__dirname, "fixtures", "navigation-page.html"), "utf8");
@@ -45,11 +45,14 @@ function jsonHeaders() {
 
 function createFakeBackend({ countsByVideo = {}, countDelayByVideo = {}, fixture = {} } = {}) {
   const blockedRequests = [];
+  const preflightRequests = [];
   const requests = [];
   const responsePlans = new Map();
   const fixtureOptions = {
     initialButtons: fixture.initialButtons !== false,
     initialState: fixture.initialState || "neutral",
+    nativeDislikeText: fixture.nativeDislikeText !== false,
+    roleAttribute: fixture.roleAttribute || "data-ryd-role",
     signedIn: fixture.signedIn !== false,
   };
 
@@ -147,6 +150,13 @@ function createFakeBackend({ countsByVideo = {}, countDelayByVideo = {}, fixture
       const html = fixtureTemplate
         .replaceAll("__VIDEO_ID__", videoId)
         .replaceAll("__SECOND_VIDEO_ID__", VIDEO_B)
+        .replaceAll("__VIDEO_LIKES__", String(countsByVideo[videoId]?.likes ?? 100))
+        .replaceAll("__SECOND_VIDEO_LIKES__", String(countsByVideo[VIDEO_B]?.likes ?? 100))
+        .replaceAll(
+          "__DISLIKE_TEXT_MARKUP__",
+          fixtureOptions.nativeDislikeText ? '<span id="text" role="text"></span>' : "",
+        )
+        .replaceAll("__FIXTURE_ROLE_ATTRIBUTE__", fixtureOptions.roleAttribute)
         .replaceAll("__INITIAL_PAGE_KIND__", isShorts ? "shorts" : url.pathname === "/watch" ? "watch" : "channel")
         .replaceAll(
           "__SHORTS_RENDERER_TAG__",
@@ -174,6 +184,22 @@ function createFakeBackend({ countsByVideo = {}, countDelayByVideo = {}, fixture
     }
 
     if (request.method() === "OPTIONS") {
+      const requestedMethod = request.headers()["access-control-request-method"];
+      const preflight = {
+        method: request.method(),
+        pathname: url.pathname,
+        requestedMethod: requestedMethod ?? null,
+        url: url.toString(),
+      };
+      if (!isAllowedApiPreflight(url.pathname, requestedMethod)) {
+        blockedRequests.push({
+          ...preflight,
+          resourceType: request.resourceType(),
+        });
+        await route.abort("blockedbyclient");
+        return;
+      }
+      preflightRequests.push(preflight);
       await route.fulfill({ status: 204, headers: jsonHeaders(), body: "" });
       return;
     }
@@ -202,11 +228,14 @@ function createFakeBackend({ countsByVideo = {}, countDelayByVideo = {}, fixture
     if (response.delayMs) await delay(response.delayMs);
 
     const body = response.body === undefined ? null : response.body;
+    const responseStatus = response.status || 200;
     await route.fulfill({
-      status: response.status || 200,
+      status: responseStatus,
       headers: { ...jsonHeaders(), ...(response.headers || {}) },
       body: typeof body === "string" ? body : JSON.stringify(body),
     });
+    record.responseBody = body;
+    record.responseStatus = responseStatus;
     record.respondedAt = Date.now();
   }
 
@@ -215,6 +244,7 @@ function createFakeBackend({ countsByVideo = {}, countDelayByVideo = {}, fixture
     defer,
     enqueue,
     handle,
+    preflightRequests,
     requests,
     requestsFor,
   };
@@ -340,17 +370,20 @@ function overrideBooleanOption(source, optionName, value) {
   return source.replace(optionPattern, `${optionName}: ${value}`);
 }
 
-async function injectGeneratedUserscript(page, { coloredThumbs, disableVoteSubmission = false, rateBarEnabled } = {}) {
-  if (!fs.existsSync(GENERATED_USERSCRIPT)) {
-    throw new Error(`Generated userscript is missing: ${GENERATED_USERSCRIPT}`);
+async function injectGeneratedUserscript(
+  page,
+  { artifactPath = GENERATED_USERSCRIPT, coloredThumbs, disableVoteSubmission = false, rateBarEnabled } = {},
+) {
+  if (!fs.existsSync(artifactPath)) {
+    throw new Error(`Generated userscript is missing: ${artifactPath}`);
   }
 
   if (!disableVoteSubmission && rateBarEnabled === undefined && coloredThumbs === undefined) {
-    await page.addScriptTag({ path: GENERATED_USERSCRIPT });
+    await page.addScriptTag({ path: artifactPath });
     return;
   }
 
-  let source = fs.readFileSync(GENERATED_USERSCRIPT, "utf8");
+  let source = fs.readFileSync(artifactPath, "utf8");
   if (disableVoteSubmission) {
     source = overrideBooleanOption(source, "disableVoteSubmission", true);
   }

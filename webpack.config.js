@@ -2,6 +2,7 @@ const path = require("path");
 const fs = require("fs");
 const CopyPlugin = require("copy-webpack-plugin");
 const webpack = require("webpack");
+const { BUILD_RECEIPT_FILENAME, createExtensionBuildReceipt } = require("./extension-build-receipt");
 const { LiveBuildMarkerPlugin, createLiveBuildId } = require("./webpack.live-build-marker");
 
 const extensionVersion = (process.env.npm_package_version || require("./package.json").version).replace("-", ".");
@@ -10,7 +11,11 @@ const entries = ["ryd.content-script", "ryd.background", "popup", "ryd.changelog
 const ignorePatterns = [
   "**/manifest-**",
   "**/dist/**",
+  "**/e2e/**",
   "**/src/**",
+  "**/*.spec.js",
+  "**/*.test.js",
+  "**/*.e2e.js",
   "**/readme.md",
   ...entries.map((entry) => `**/${entry}.js`),
 ];
@@ -68,9 +73,38 @@ class MirrorJsOutputsPlugin {
   }
 }
 
+class ExtensionBuildReceiptPlugin {
+  constructor(mode) {
+    this.mode = mode;
+    this.receipt = null;
+  }
+
+  apply(compiler) {
+    compiler.hooks.beforeCompile.tap("ExtensionBuildReceiptPlugin", () => {
+      this.receipt = createExtensionBuildReceipt(__dirname, this.mode);
+    });
+    compiler.hooks.thisCompilation.tap("ExtensionBuildReceiptPlugin", (compilation) => {
+      compilation.hooks.processAssets.tap(
+        {
+          name: "ExtensionBuildReceiptPlugin",
+          stage: webpack.Compilation.PROCESS_ASSETS_STAGE_REPORT,
+        },
+        () => {
+          if (!this.receipt) throw new Error("The extension build receipt was not captured before compilation.");
+          compilation.emitAsset(
+            BUILD_RECEIPT_FILENAME,
+            new webpack.sources.RawSource(`${JSON.stringify(this.receipt, null, 2)}\n`),
+          );
+        },
+      );
+    });
+  }
+}
+
 module.exports = (env = {}, argv = {}) => {
   const liveTestBuild = env.liveTest === true || env.liveTest === "true";
   const liveBuildId = createLiveBuildId(liveTestBuild);
+  const buildMode = argv.mode || "production";
 
   return {
     entry: Object.fromEntries(
@@ -89,6 +123,7 @@ module.exports = (env = {}, argv = {}) => {
       ignored: "**/dist/**",
     },
     plugins: [
+      new ExtensionBuildReceiptPlugin(buildMode),
       new webpack.DefinePlugin({
         __RYD_LIVE_BUILD_ID__: JSON.stringify(liveBuildId),
         __RYD_LIVE_TEST_BUILD__: JSON.stringify(liveTestBuild),

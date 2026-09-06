@@ -1,7 +1,8 @@
 const { assertLogicalVoteHandshake } = require("../e2e/live/live-youtube-driver");
 
 const VIDEO_ID = "abcdefghijk";
-const USER_ID = "shared-user-id";
+const USER_ID = "A".repeat(36);
+const SOLUTION = Buffer.alloc(4).toString("base64");
 
 function vote({ status = 200, userId = USER_ID, value = 1, videoId = VIDEO_ID } = {}) {
   return {
@@ -14,7 +15,7 @@ function vote({ status = 200, userId = USER_ID, value = 1, videoId = VIDEO_ID } 
 
 function confirmation({ confirmed = true, status = 200, userId = USER_ID, videoId = VIDEO_ID } = {}) {
   return {
-    body: { solution: "proof", userId, videoId },
+    body: { solution: SOLUTION, userId, videoId },
     pathname: "/interact/confirmVote",
     responseBody: confirmed,
     responseError: null,
@@ -42,11 +43,22 @@ describe("live logical vote handshake validation", () => {
   });
 
   test.each([
-    ["user", [vote(), vote({ userId: "another-user" }), confirmation()], /different user IDs/],
+    ["user", [vote(), vote({ userId: "B".repeat(36) }), confirmation()], /different user IDs/],
     ["video", [vote(), vote({ videoId: "lmnopqrstuv" }), confirmation()], /different video/],
     ["value", [vote(), vote({ value: 0 }), confirmation()], /changed the requested vote value/],
   ])("rejects a retry with a mismatched %s", (_field, records, message) => {
     expect(() => assertLogicalVoteHandshake(records, VIDEO_ID, 1)).toThrow(message);
+  });
+
+  test("rejects a complete handshake that targets the stale origin video", () => {
+    const staleVideoId = "lmnopqrstuv";
+    expect(() =>
+      assertLogicalVoteHandshake(
+        [vote({ videoId: staleVideoId }), confirmation({ videoId: staleVideoId })],
+        VIDEO_ID,
+        1,
+      ),
+    ).toThrow(/targeted a different video/);
   });
 
   test.each([
@@ -63,6 +75,27 @@ describe("live logical vote handshake validation", () => {
     expect(() => assertLogicalVoteHandshake([vote(), confirmation({ confirmed: false })], VIDEO_ID, 1)).toThrow(
       /did not confirm the vote/,
     );
+  });
+
+  test.each([
+    ["short user ID", [vote({ userId: "short" }), confirmation({ userId: "short" })], /36-character/],
+    [
+      "extra vote body key",
+      [{ ...vote(), body: { ...vote().body, extra: true } }, confirmation()],
+      /exactly userId, value, and videoId/,
+    ],
+    [
+      "extra confirmation body key",
+      [vote(), { ...confirmation(), body: { ...confirmation().body, extra: true } }],
+      /exactly solution, userId, and videoId/,
+    ],
+    [
+      "non-four-byte proof",
+      [vote(), { ...confirmation(), body: { ...confirmation().body, solution: "AA==" } }],
+      /four-byte proof/,
+    ],
+  ])("rejects a handshake with a %s", (_label, records, message) => {
+    expect(() => assertLogicalVoteHandshake(records, VIDEO_ID, 1)).toThrow(message);
   });
 
   test("rejects a failed vote or confirmation response", () => {

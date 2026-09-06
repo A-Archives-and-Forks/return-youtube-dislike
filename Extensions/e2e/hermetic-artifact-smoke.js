@@ -8,24 +8,46 @@ const {
   VIDEO_A,
   VIDEO_B,
   createFakeBackend,
+  injectGeneratedUserscript,
   installGmEnvironment,
   openNavigationFixture,
   openWatchFixture,
 } = require("../UserScript/e2e/harness");
 const { assertInvariantContinuously, waitForStableInvariant } = require("./continuous-invariants");
+const {
+  WORKER_SIGNAL_PATH,
+  assertExactSuccessfulVotesTraffic,
+  isAllowedApiPreflight,
+} = require("./hermetic-api-contract");
 const { LIVE_RUNTIME_PROFILES } = require("./live-runtime-adapter");
 const { SHARED_LIVE_SCENARIO_IDS } = require("./shared-live-scenarios");
+const { assertProductionJavaScriptOutput } = require("./verify-extension-artifact");
+const { isVoteProtocolBodyPairValid } = require("./vote-protocol-contract");
 
 const REPOSITORY_ROOT = path.resolve(__dirname, "../..");
 const PRODUCTION_API_ORIGIN = "https://returnyoutubedislikeapi.com";
 const ARTIFACT_SMOKE_SCENARIO_ID = "watch-render";
 const ARTIFACT_WATCH_SPA_SCENARIO_ID = "watch-spa-side-panel";
 const ARTIFACT_WATCH_SPA_VOTE_SCENARIO_ID = "watch-spa-dislike-activation";
+const ARTIFACT_WATCH_SPA_CLONED_VOTE_SCENARIO_ID = "watch-spa-cloned-controls-immediate-dislike";
 const ARTIFACT_EXTENSION_DELAYED_FAILURE_SCENARIO_ID = "extension-watch-spa-delayed-outgoing-failure";
+const ARTIFACT_NATIVE_HYDRATION_DELAY_MS = 750;
 const SHARED_ARTIFACT_SCENARIO_IDS = Object.freeze([
   ARTIFACT_SMOKE_SCENARIO_ID,
   ARTIFACT_WATCH_SPA_SCENARIO_ID,
   ARTIFACT_WATCH_SPA_VOTE_SCENARIO_ID,
+  ARTIFACT_WATCH_SPA_CLONED_VOTE_SCENARIO_ID,
+]);
+const SHARED_ARTIFACT_RUNTIMES = Object.freeze(["userscript", "extension"]);
+const EXTENSION_ONLY_ARTIFACT_CAPABILITIES = Object.freeze(["background", "premium", "settings"]);
+const ARTIFACT_BROWSER_SCENARIO_CATALOG = Object.freeze([
+  ...SHARED_ARTIFACT_SCENARIO_IDS.map((id) => Object.freeze({ id, runtimes: SHARED_ARTIFACT_RUNTIMES, shared: true })),
+  Object.freeze({
+    capability: "background",
+    id: ARTIFACT_EXTENSION_DELAYED_FAILURE_SCENARIO_ID,
+    runtimes: Object.freeze(["extension"]),
+    shared: false,
+  }),
 ]);
 const SPA_COUNTS = Object.freeze({
   [VIDEO_A]: Object.freeze({ dislikes: 10, likes: 90 }),
@@ -43,7 +65,90 @@ const ZERO_DIFFICULTY_PUZZLE = {
   difficulty: 0,
 };
 const ARTIFACT_UNHANDLED_REJECTION_BINDING = "__rydArtifactReportUnhandledRejection";
-const CONSOLE_FAILURE_TYPES = new Set(["assert", "error"]);
+const ARTIFACT_WORKER_SIGNAL_STORE = "__rydArtifactWorkerSignals";
+const CONSOLE_FAILURE_TYPES = new Set(["assert", "error", "warning"]);
+const SHARED_ARTIFACT_FIXTURE_DEFAULTS = Object.freeze({
+  nativeDislikeText: false,
+  roleAttribute: "data-fixture-role",
+});
+const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+function assertArtifactBrowserScenarioCatalog(catalog = ARTIFACT_BROWSER_SCENARIO_CATALOG) {
+  assert.ok(Array.isArray(catalog), "The hermetic artifact browser catalog must be an array.");
+  assert.equal(
+    new Set(catalog.map(({ id }) => id)).size,
+    catalog.length,
+    "Artifact browser scenario IDs must be unique.",
+  );
+  const byId = new Map(catalog.map((entry) => [entry.id, entry]));
+
+  for (const scenarioId of SHARED_ARTIFACT_SCENARIO_IDS) {
+    const entry = byId.get(scenarioId);
+    assert.ok(entry, `The shared artifact browser catalog is missing ${scenarioId}.`);
+    assert.equal(entry.shared, true, `The core artifact browser scenario ${scenarioId} must remain shared.`);
+    assert.deepEqual(
+      entry.runtimes,
+      SHARED_ARTIFACT_RUNTIMES,
+      `The core artifact browser scenario ${scenarioId} must run for userscript and extension.`,
+    );
+    assert.equal(entry.capability, undefined, `The shared artifact browser scenario ${scenarioId} is misclassified.`);
+  }
+
+  for (const entry of catalog) {
+    assert.equal(typeof entry.id, "string", "Every artifact browser scenario must have a string ID.");
+    assert.equal(
+      typeof entry.shared,
+      "boolean",
+      `Artifact browser scenario ${entry.id} must declare shared explicitly.`,
+    );
+    if (entry.shared) {
+      assert.ok(
+        SHARED_ARTIFACT_SCENARIO_IDS.includes(entry.id),
+        `Unknown shared artifact browser scenario ${entry.id} must be added to the shared scenario contract.`,
+      );
+      assert.deepEqual(
+        entry.runtimes,
+        SHARED_ARTIFACT_RUNTIMES,
+        `The core artifact browser scenario ${entry.id} must run for userscript and extension.`,
+      );
+      assert.equal(entry.capability, undefined, `The shared artifact browser scenario ${entry.id} is misclassified.`);
+    } else {
+      assert.deepEqual(
+        entry.runtimes,
+        ["extension"],
+        `Extension-only scenario ${entry.id} must run only for extension.`,
+      );
+      assert.ok(
+        EXTENSION_ONLY_ARTIFACT_CAPABILITIES.includes(entry.capability),
+        `Extension-only scenario ${entry.id} must declare a supported capability.`,
+      );
+    }
+  }
+  return catalog;
+}
+
+function createArtifactBrowserScenarioPlan(catalog = ARTIFACT_BROWSER_SCENARIO_CATALOG) {
+  return assertArtifactBrowserScenarioCatalog(catalog).flatMap(({ id: scenarioId, runtimes }) =>
+    runtimes.map((runtime) => Object.freeze({ runtime, scenarioId })),
+  );
+}
+
+function createSharedArtifactBackendOptions(backendOptions = {}) {
+  if (!backendOptions || typeof backendOptions !== "object" || Array.isArray(backendOptions)) {
+    throw new TypeError("Shared artifact backend options must be an object.");
+  }
+  const fixture = backendOptions.fixture ?? {};
+  if (!fixture || typeof fixture !== "object" || Array.isArray(fixture)) {
+    throw new TypeError("Shared artifact fixture options must be an object.");
+  }
+  return {
+    ...backendOptions,
+    fixture: {
+      ...SHARED_ARTIFACT_FIXTURE_DEFAULTS,
+      ...fixture,
+    },
+  };
+}
 
 function serializeBrowserError(error) {
   return {
@@ -132,6 +237,160 @@ async function createPageSignalCollector(page, runtime) {
   };
 }
 
+function createWorkerRuntimeProbe(signalEndpoint) {
+  const endpoint = JSON.stringify(signalEndpoint);
+  const signalStore = JSON.stringify(ARTIFACT_WORKER_SIGNAL_STORE);
+  return `;(() => {
+  const endpoint = ${endpoint};
+  const signals = [];
+  Object.defineProperty(globalThis, ${signalStore}, { configurable: false, value: signals, writable: false });
+  const serialize = (kind, value, details = {}) => {
+    let message;
+    let name = kind === "unhandledrejection" ? "UnhandledRejection" : "Error";
+    let stack = null;
+    if (value instanceof Error || (value && typeof value.message === "string")) {
+      message = value.message;
+      name = typeof value.name === "string" ? value.name : name;
+      stack = typeof value.stack === "string" ? value.stack : null;
+    } else {
+      try {
+        message = typeof value === "string" ? value : JSON.stringify(value);
+      } catch {
+        message = String(value);
+      }
+      if (message === undefined) message = String(value);
+    }
+    return { at: Date.now(), details, kind, message, name, stack };
+  };
+  const report = (kind, value, details) => {
+    const signal = serialize(kind, value, details);
+    signals.push(signal);
+    void fetch(endpoint, {
+      body: JSON.stringify(signal),
+      headers: { "content-type": "text/plain;charset=UTF-8" },
+      method: "POST",
+    }).catch(() => {});
+  };
+  globalThis.addEventListener("error", (event) => {
+    report("error", event.error || event.message, {
+      column: event.colno || null,
+      filename: event.filename || null,
+      line: event.lineno || null,
+    });
+  });
+  globalThis.addEventListener("unhandledrejection", (event) => report("unhandledrejection", event.reason));
+  for (const [method, kind] of [["error", "console-error"], ["warn", "console-warning"]]) {
+    const original = console[method].bind(console);
+    console[method] = (...values) => {
+      report(kind, values.map((value) => (typeof value === "string" ? value : String(value))).join(" "));
+      return original(...values);
+    };
+  }
+  const originalAssert = console.assert.bind(console);
+  console.assert = (condition, ...values) => {
+    if (!condition) report("console-assert", values.join(" ") || "Assertion failed");
+    return originalAssert(condition, ...values);
+  };
+})();`;
+}
+
+function createWorkerSignalCollector(worker, apiServer) {
+  assert.ok(worker && typeof worker.evaluate === "function", "A Playwright MV3 worker is required.");
+  assert.ok(Array.isArray(apiServer?.workerSignals), "The hermetic server must expose worker signals.");
+
+  const consoleFailures = [];
+  let evaluatedSignals = [];
+  let evaluationFailure = null;
+
+  worker.on("console", (message) => {
+    if (!CONSOLE_FAILURE_TYPES.has(message.type())) return;
+    consoleFailures.push({ text: message.text(), type: message.type() });
+  });
+
+  async function refresh() {
+    try {
+      await worker.evaluate(() => new Promise((resolve) => globalThis.setTimeout(resolve, 0)));
+      evaluatedSignals = await worker.evaluate((storeName) => {
+        const signals = globalThis[storeName];
+        if (!Array.isArray(signals)) throw new Error(`Missing MV3 worker signal probe ${storeName}`);
+        return signals.map((signal) => ({ ...signal }));
+      }, ARTIFACT_WORKER_SIGNAL_STORE);
+      evaluationFailure = null;
+    } catch (error) {
+      evaluationFailure = serializeBrowserError(error);
+    }
+  }
+
+  const snapshot = () => ({
+    consoleFailures: consoleFailures.map((signal) => ({ ...signal })),
+    evaluatedSignals: evaluatedSignals.map((signal) => ({ ...signal })),
+    evaluationFailure: evaluationFailure ? { ...evaluationFailure } : null,
+    reportedSignals: apiServer.workerSignals.map((signal) => ({ ...signal })),
+    workerUrl: worker.url(),
+  });
+
+  return {
+    async assertClean(scenarioId) {
+      await refresh();
+      const diagnostics = snapshot();
+      const signalCount =
+        diagnostics.consoleFailures.length +
+        diagnostics.evaluatedSignals.length +
+        diagnostics.reportedSignals.length +
+        Number(Boolean(diagnostics.evaluationFailure));
+      assert.equal(
+        signalCount,
+        0,
+        `extension MV3 worker emitted unexpected runtime signals during ${scenarioId}: ${JSON.stringify(
+          diagnostics,
+          null,
+          2,
+        )}`,
+      );
+      return diagnostics;
+    },
+    refresh,
+    snapshot,
+  };
+}
+
+function combineExtensionSignalCollectors(pageCollector, workerCollector) {
+  return {
+    async assertClean(scenarioId) {
+      let pageFailure = null;
+      let pageDiagnostics;
+      try {
+        pageDiagnostics = await pageCollector.assertClean(scenarioId);
+      } catch (error) {
+        pageFailure = error;
+        pageDiagnostics = pageCollector.snapshot();
+      }
+
+      let workerFailure = null;
+      let workerDiagnostics;
+      try {
+        workerDiagnostics = await workerCollector.assertClean(scenarioId);
+      } catch (error) {
+        workerFailure = error;
+        workerDiagnostics = workerCollector.snapshot();
+      }
+
+      if (pageFailure || workerFailure) {
+        throw new Error(
+          `extension emitted unexpected runtime signals during ${scenarioId}: ${JSON.stringify(
+            { page: pageDiagnostics, worker: workerDiagnostics },
+            null,
+            2,
+          )}`,
+          { cause: pageFailure ?? workerFailure },
+        );
+      }
+      return { page: pageDiagnostics, worker: workerDiagnostics };
+    },
+    snapshot: () => ({ page: pageCollector.snapshot(), worker: workerCollector.snapshot() }),
+  };
+}
+
 function assertLoopbackOrigin(value) {
   const url = new URL(value);
   assert.ok(["http:", "https:"].includes(url.protocol), "The hermetic API origin must use HTTP or HTTPS.");
@@ -150,6 +409,34 @@ function removeOwnedTemporaryDirectory(directory, prefix) {
   assert.equal(path.dirname(resolvedDirectory), resolvedTemporaryRoot, "Refusing to remove a non-temporary directory.");
   assert.ok(path.basename(resolvedDirectory).startsWith(prefix), "Refusing to remove an unowned temporary directory.");
   fs.rmSync(resolvedDirectory, { force: true, recursive: true });
+}
+
+function readGeneratedMv3Contract(artifactDirectory) {
+  const manifestPath = path.join(artifactDirectory, "manifest.json");
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  assert.equal(manifest.manifest_version, 3, "The extension browser suite requires a generated MV3 artifact.");
+  assert.equal(
+    manifest.background?.service_worker,
+    "ryd.background.js",
+    "The generated MV3 artifact must declare the built background service worker.",
+  );
+  const contentScript = manifest.content_scripts?.find(
+    ({ css = [], js = [] }) => js.includes("ryd.content-script.js") && css.includes("content-style.css"),
+  );
+  assert.ok(contentScript, "The generated MV3 artifact must declare its built content script and stylesheet.");
+  for (const asset of [manifest.background.service_worker, "ryd.content-script.js", "content-style.css"]) {
+    assert.ok(
+      fs.statSync(path.join(artifactDirectory, asset)).isFile(),
+      `The generated MV3 artifact is missing declared asset ${asset}.`,
+    );
+  }
+  for (const asset of new Set([manifest.background.service_worker, ...contentScript.js])) {
+    assertProductionJavaScriptOutput(path.join(artifactDirectory, asset), asset);
+  }
+  return {
+    serviceWorkerPath: `/${manifest.background.service_worker.replace(/^\/+/, "")}`,
+    version: manifest.version,
+  };
 }
 
 function prepareHermeticExtensionArtifact(sourceDirectory, apiOrigin) {
@@ -189,7 +476,8 @@ function prepareHermeticExtensionArtifact(sourceDirectory, apiOrigin) {
     changelogListener,
     "api.runtime.onInstalled.addListener(() => {});",
   );
-  fs.writeFileSync(backgroundBundlePath, hermeticBackground);
+  const workerSignalEndpoint = `${origin}${WORKER_SIGNAL_PATH}`;
+  fs.writeFileSync(backgroundBundlePath, `${createWorkerRuntimeProbe(workerSignalEndpoint)}\n${hermeticBackground}`);
 
   const contentScriptPath = path.join(extensionDirectory, "ryd.content-script.js");
   const contentScriptSource = fs.readFileSync(contentScriptPath, "utf8");
@@ -211,6 +499,7 @@ function prepareHermeticExtensionArtifact(sourceDirectory, apiOrigin) {
     replacements: { "ryd.background.js": replacementCount, firstInstallChangelogListener: 1 },
     routedBundles: ["ryd.content-script.js"],
     temporaryRoot,
+    workerSignalEndpoint,
   };
 }
 
@@ -237,10 +526,56 @@ function readRequestBody(request) {
 async function startHermeticApiServer({ dislikes = 25, likes = 100 } = {}) {
   const records = [];
   const unexpectedRequests = [];
+  const workerSignals = [];
+  const responsePlans = new Map();
+  const responseKey = (method, pathname) => `${method.toUpperCase()} ${pathname}`;
+  const enqueue = (method, pathname, plannedResponse) => {
+    const key = responseKey(method, pathname);
+    const queue = responsePlans.get(key) ?? [];
+    queue.push(plannedResponse);
+    responsePlans.set(key, queue);
+  };
+  const defer = (method, pathname) => {
+    let releaseResponse;
+    let resolveSeen;
+    let released = false;
+    const seen = new Promise((resolve) => {
+      resolveSeen = resolve;
+    });
+    enqueue(method, pathname, (record) => {
+      resolveSeen(record);
+      return new Promise((resolve) => {
+        releaseResponse = resolve;
+      });
+    });
+    return {
+      get released() {
+        return released;
+      },
+      release(response) {
+        if (released) return;
+        if (!releaseResponse) {
+          throw new Error(`Cannot release ${responseKey(method, pathname)} before its request is seen`);
+        }
+        released = true;
+        releaseResponse(response);
+      },
+      seen,
+    };
+  };
+  const requestsFor = (method, pathname) =>
+    records.filter((record) => record.method === method.toUpperCase() && record.pathname === pathname);
+  const takePlannedResponse = (record) => {
+    const queue = responsePlans.get(responseKey(record.method, record.pathname));
+    if (!queue?.length) return null;
+    const planned = queue.shift();
+    return typeof planned === "function" ? planned(record) : planned;
+  };
   const server = http.createServer(async (request, response) => {
     const origin = `http://${request.headers.host}`;
     const url = new URL(request.url, origin);
     const record = {
+      at: Date.now(),
       body: await readRequestBody(request),
       method: request.method,
       pathname: url.pathname,
@@ -255,6 +590,16 @@ async function startHermeticApiServer({ dislikes = 25, likes = 100 } = {}) {
       "content-type": "application/json; charset=utf-8",
     };
     if (request.method === "OPTIONS") {
+      const requestedMethod = request.headers["access-control-request-method"];
+      if (!isAllowedApiPreflight(url.pathname, requestedMethod)) {
+        unexpectedRequests.push(record);
+        record.respondedAt = Date.now();
+        record.responseBody = { error: "unexpected hermetic preflight" };
+        record.responseStatus = 404;
+        response.writeHead(404, headers);
+        response.end(JSON.stringify(record.responseBody));
+        return;
+      }
       record.respondedAt = Date.now();
       record.responseBody = null;
       record.responseStatus = 204;
@@ -263,13 +608,24 @@ async function startHermeticApiServer({ dislikes = 25, likes = 100 } = {}) {
       return;
     }
 
-    let body;
-    if (request.method === "GET" && url.pathname === "/configs/selectors") body = {};
-    else if (request.method === "GET" && url.pathname === "/votes") body = { dislikes, likes, rating: 4.5 };
-    else if (request.method === "GET" && url.pathname === "/puzzle/registration") body = ZERO_DIFFICULTY_PUZZLE;
-    else if (request.method === "POST" && url.pathname === "/puzzle/registration") body = true;
-    else if (request.method === "POST" && url.pathname === "/interact/vote") body = ZERO_DIFFICULTY_PUZZLE;
-    else if (request.method === "POST" && url.pathname === "/interact/confirmVote") body = true;
+    if (request.method === "POST" && url.pathname === WORKER_SIGNAL_PATH) {
+      workerSignals.push(record.body);
+      record.respondedAt = Date.now();
+      record.responseBody = null;
+      record.responseStatus = 204;
+      response.writeHead(204, headers);
+      response.end();
+      return;
+    }
+    let defaultBody;
+    if (request.method === "GET" && url.pathname === "/configs/selectors") defaultBody = {};
+    else if (request.method === "GET" && url.pathname === "/votes") {
+      defaultBody = { dislikes, likes, rating: 4.5 };
+    } else if (request.method === "GET" && url.pathname === "/puzzle/registration") {
+      defaultBody = ZERO_DIFFICULTY_PUZZLE;
+    } else if (request.method === "POST" && url.pathname === "/puzzle/registration") defaultBody = true;
+    else if (request.method === "POST" && url.pathname === "/interact/vote") defaultBody = ZERO_DIFFICULTY_PUZZLE;
+    else if (request.method === "POST" && url.pathname === "/interact/confirmVote") defaultBody = true;
     else {
       unexpectedRequests.push(record);
       record.respondedAt = Date.now();
@@ -280,11 +636,17 @@ async function startHermeticApiServer({ dislikes = 25, likes = 100 } = {}) {
       return;
     }
 
+    const planned = takePlannedResponse(record);
+    const resolvedPlan = planned ? await planned : planned;
+    const responsePlan = resolvedPlan ?? { body: defaultBody };
+    if (responsePlan.delayMs) await delay(responsePlan.delayMs);
+    const body = responsePlan.body === undefined ? defaultBody : responsePlan.body;
+    const status = responsePlan.status ?? 200;
     record.respondedAt = Date.now();
     record.responseBody = body;
-    record.responseStatus = 200;
-    response.writeHead(200, headers);
-    response.end(JSON.stringify(body));
+    record.responseStatus = status;
+    response.writeHead(status, { ...headers, ...(responsePlan.headers ?? {}) });
+    response.end(typeof body === "string" ? body : JSON.stringify(body));
   });
 
   await new Promise((resolve, reject) => {
@@ -296,9 +658,13 @@ async function startHermeticApiServer({ dislikes = 25, likes = 100 } = {}) {
 
   return {
     close: () => new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))),
+    defer,
+    enqueue,
     origin: `http://127.0.0.1:${address.port}`,
     records,
+    requestsFor,
     unexpectedRequests,
+    workerSignals,
   };
 }
 
@@ -319,43 +685,93 @@ async function installArtifactRoutes(context, backend, { passthroughOrigin = nul
 
 async function waitForWatchResult(page, runtime, videoId) {
   const profile = LIVE_RUNTIME_PROFILES[runtime];
+  const dislikeTextSelector = [
+    "dislike-button-view-model #text",
+    "dislike-button-view-model [role='text']",
+    "dislike-button-view-model .yt-spec-button-shape-next__button-text-content",
+    "dislike-button-view-model .ytSpecButtonShapeNextButtonTextContent",
+  ].join(", ");
   await page.waitForFunction(
-    ({ rateBarContainer, videoId: expectedVideoId }) => {
-      const watch = document.querySelector(`ytd-watch-flexy[video-id="${expectedVideoId}"]`);
-      const dislikeText = watch
-        ? document.querySelector('[data-ryd-role="dislike"] #text, [data-ryd-role="dislike"] [role="text"]')
+    ({ dislikeTextSelector: expectedDislikeTextSelector, rateBarContainer, videoId: expectedVideoId }) => {
+      const rendered = (element) => {
+        if (!element?.isConnected || element.closest("[hidden], [aria-hidden='true'], [inert]")) return false;
+        const box = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        return (
+          box.width > 0 &&
+          box.height > 0 &&
+          style.display !== "none" &&
+          style.visibility !== "hidden" &&
+          Number.parseFloat(style.opacity) !== 0
+        );
+      };
+      const watch = document.querySelector(
+        `ytd-watch-flexy[video-id="${expectedVideoId}"], ytd-watch-grid[video-id="${expectedVideoId}"]`,
+      );
+      const actionSurface = watch
+        ? [...watch.querySelectorAll("#top-level-buttons-computed")].find(
+            (candidate) => rendered(candidate) && rendered(candidate.querySelector(rateBarContainer)),
+          )
         : null;
+      const dislikeText = actionSurface?.querySelector(expectedDislikeTextSelector) ?? null;
       const count = (dislikeText?.textContent ?? "").replace(/\s+/g, " ").trim();
-      const bar = document.querySelector(rateBarContainer);
-      return watch && bar && /\d/.test(count);
+      return Boolean(actionSurface && rendered(dislikeText) && /\d/.test(count));
     },
-    { rateBarContainer: profile.selectors.rateBarContainer, videoId },
+    { dislikeTextSelector, rateBarContainer: profile.selectors.rateBarContainer, videoId },
   );
 
   return page.evaluate(
-    ({ rateBar, rateBarContainer, videoId: expectedVideoId }) => {
-      const dislikeText = document.querySelector(
-        '[data-ryd-role="dislike"] #text, [data-ryd-role="dislike"] [role="text"]',
+    ({ dislikeTextSelector: expectedDislikeTextSelector, rateBar, rateBarContainer, videoId: expectedVideoId }) => {
+      const rendered = (element) => {
+        if (!element?.isConnected || element.closest("[hidden], [aria-hidden='true'], [inert]")) return false;
+        const box = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        return (
+          box.width > 0 &&
+          box.height > 0 &&
+          style.display !== "none" &&
+          style.visibility !== "hidden" &&
+          Number.parseFloat(style.opacity) !== 0
+        );
+      };
+      const watch = document.querySelector(
+        `ytd-watch-flexy[video-id="${expectedVideoId}"], ytd-watch-grid[video-id="${expectedVideoId}"]`,
       );
-      const container = document.querySelector(rateBarContainer);
-      const fill = document.querySelector(rateBar);
+      const actionSurface = watch
+        ? [...watch.querySelectorAll("#top-level-buttons-computed")].find(
+            (candidate) => rendered(candidate) && rendered(candidate.querySelector(rateBarContainer)),
+          )
+        : null;
+      const dislikeText = actionSurface?.querySelector(expectedDislikeTextSelector) ?? null;
+      const container = actionSurface?.querySelector(rateBarContainer);
+      const fill = actionSurface?.querySelector(rateBar);
       const visible = (element) => {
         const box = element?.getBoundingClientRect();
         return Boolean(box && box.width > 0 && box.height > 0);
       };
       return {
+        actionSurfaceVisible: rendered(actionSurface),
         count: (dislikeText?.textContent ?? "").replace(/\s+/g, " ").trim(),
+        countVisible: rendered(dislikeText),
         fillRatio:
           container && fill && container.getBoundingClientRect().width > 0
             ? fill.getBoundingClientRect().width / container.getBoundingClientRect().width
             : null,
         fillVisible: visible(fill),
+        ownedByExpectedWatch: Boolean(
+          actionSurface && actionSurface.closest("ytd-watch-flexy, ytd-watch-grid") === watch,
+        ),
         rateBarVisible: visible(container),
-        videoId: document.querySelector("ytd-watch-flexy")?.getAttribute("video-id") ?? null,
+        sameActionSurface: Boolean(
+          actionSurface &&
+            dislikeText?.closest("#top-level-buttons-computed") === actionSurface &&
+            container?.closest("#top-level-buttons-computed") === actionSurface,
+        ),
+        videoId: watch?.getAttribute("video-id") ?? null,
         expectedVideoId,
       };
     },
-    { ...profile.selectors, videoId },
+    { ...profile.selectors, dislikeTextSelector, videoId },
   );
 }
 
@@ -414,63 +830,114 @@ async function preparePendingSpaOutgoingControls(page, fromVideoId) {
   }, fromVideoId);
 }
 
-async function finishSpaDestinationReplacement(page, toVideoId) {
-  return page.evaluate(
-    ({ expectedLikes, expectedVideoId }) => {
-      const currentSection = document.querySelector(
-        `#fixture-page [data-fixture-page-kind="watch"][data-fixture-video-id="${expectedVideoId}"]`,
-      );
-      if (!currentSection) throw new Error(`The destination watch fixture for ${expectedVideoId} is missing.`);
-      if (!globalThis.__artifactInsideOutgoingActions) {
-        throw new Error("The retained inside-current-root outgoing controls are missing.");
-      }
+function replaceSpaDestinationInPage({ expectedLikes, expectedVideoId, nativeHydrationDelay, beforeNavigation }) {
+  const replace = () => {
+    const currentSection = document.querySelector(
+      `#fixture-page [data-fixture-page-kind="watch"][data-fixture-video-id="${expectedVideoId}"]`,
+    );
+    if (!currentSection) throw new Error(`The destination watch fixture for ${expectedVideoId} is missing.`);
+    if (!globalThis.__artifactInsideOutgoingActions) {
+      throw new Error("The retained inside-current-root outgoing controls are missing.");
+    }
 
-      const insideHolder = document.createElement("div");
-      insideHolder.hidden = true;
-      insideHolder.setAttribute("data-artifact-outgoing-position", "inside-current-root");
-      insideHolder.setAttribute(
-        "data-artifact-outgoing-video-id",
-        globalThis.__artifactInsideOutgoingActions
-          .querySelector("[data-fixture-control-video-id]")
-          ?.getAttribute("data-fixture-control-video-id") ?? "unknown",
-      );
-      insideHolder.appendChild(globalThis.__artifactInsideOutgoingActions);
-      currentSection.appendChild(insideHolder);
-      delete globalThis.__artifactInsideOutgoingActions;
+    const insideHolder = document.createElement("div");
+    insideHolder.hidden = true;
+    insideHolder.setAttribute("data-artifact-outgoing-position", "inside-current-root");
+    insideHolder.setAttribute(
+      "data-artifact-outgoing-video-id",
+      globalThis.__artifactInsideOutgoingActions
+        .querySelector("[data-fixture-control-video-id]")
+        ?.getAttribute("data-fixture-control-video-id") ?? "unknown",
+    );
+    insideHolder.appendChild(globalThis.__artifactInsideOutgoingActions);
+    const watchRoot = currentSection.querySelector(
+      `ytd-watch-flexy[video-id="${expectedVideoId}"], ytd-watch-grid[video-id="${expectedVideoId}"]`,
+    );
+    if (!watchRoot) throw new Error(`The destination Watch root for ${expectedVideoId} is missing.`);
+    watchRoot.appendChild(insideHolder);
+    delete globalThis.__artifactInsideOutgoingActions;
 
-      const replaced = globalThis.__navigationFixture.replaceCurrentWatchActions({ retainOutgoing: true });
-      if (!replaced) throw new Error(`The destination action container for ${expectedVideoId} was not replaced.`);
-      const destinationActions = currentSection.querySelector(
-        `#top-level-buttons-computed[data-fixture-watch-actions-replacement="${expectedVideoId}"]`,
-      );
-      const likeButton = destinationActions?.querySelector('[data-ryd-role="like"] button');
-      if (!likeButton) throw new Error(`The replacement controls for ${expectedVideoId} have no Like button.`);
-      likeButton.setAttribute("aria-label", `${expectedLikes} likes`);
-      const likeText = likeButton.querySelector("#text, [role='text']");
-      if (likeText) likeText.textContent = String(expectedLikes);
-      return { destinationReplaced: true, insideBarCount: insideHolder.querySelectorAll(".ryd-tooltip").length };
+    const currentActions = watchRoot.querySelector(":scope > #top-row #top-level-buttons-computed");
+    const currentLikeButton = currentActions?.querySelector('[data-fixture-role="like"] button');
+    if (!currentLikeButton) throw new Error(`The destination controls for ${expectedVideoId} have no Like button.`);
+    currentLikeButton.setAttribute("aria-label", `${expectedLikes} likes`);
+    const currentLikeText = currentLikeButton.querySelector("#text, [role='text']");
+    if (currentLikeText) currentLikeText.textContent = String(expectedLikes);
+
+    const nativeHydrationStartedAt = Date.now();
+    const replaced = globalThis.__navigationFixture.replaceCurrentWatchActions({
+      nativeHydrationDelay,
+      retainOutgoing: true,
+    });
+    if (!replaced) throw new Error(`The destination action container for ${expectedVideoId} was not replaced.`);
+    const destinationActions = currentSection.querySelector(
+      `#top-level-buttons-computed[data-fixture-watch-actions-replacement="${expectedVideoId}"]`,
+    );
+    const likeButton = destinationActions?.querySelector('[data-fixture-role="like"] button');
+    if (nativeHydrationDelay === 0 && !likeButton) {
+      throw new Error(`The replacement controls for ${expectedVideoId} have no Like button.`);
+    }
+    return {
+      destinationReplaced: true,
+      insideBarCount: insideHolder.querySelectorAll(".ryd-tooltip").length,
+      nativeHydrationDelay,
+      nativeHydrationStartedAt,
+    };
+  };
+  if (!beforeNavigation) return replace();
+  delete globalThis.__artifactPreparedDestinationReplacement;
+  document.addEventListener(
+    "yt-navigate-finish",
+    () => {
+      // Capture runs before the extension's navigation listeners, so they never
+      // see hydrated destination controls that the fixture removes afterwards.
+      globalThis.__artifactPreparedDestinationReplacement = replace();
     },
-    { expectedLikes: SPA_COUNTS[toVideoId].likes, expectedVideoId: toVideoId },
+    { capture: true, once: true },
   );
 }
 
+async function finishSpaDestinationReplacement(
+  page,
+  toVideoId,
+  { nativeHydrationDelay = 0, beforeNavigation = false } = {},
+) {
+  return page.evaluate(replaceSpaDestinationInPage, {
+    expectedLikes: SPA_COUNTS[toVideoId].likes,
+    expectedVideoId: toVideoId,
+    nativeHydrationDelay,
+    beforeNavigation,
+  });
+}
+
 async function observeSpaDestinationDislikeText(page, videoId) {
+  await page.waitForFunction((expectedVideoId) => {
+    const currentRoot = document.querySelector(
+      `#fixture-page [data-fixture-page-kind="watch"][data-fixture-video-id="${expectedVideoId}"]`,
+    );
+    return Boolean(
+      currentRoot?.querySelector(
+        `#top-level-buttons-computed[data-fixture-watch-actions-replacement="${expectedVideoId}"] ` +
+          `[data-fixture-control-video-id="${expectedVideoId}"] [data-fixture-role="dislike"]`,
+      ),
+    );
+  }, videoId);
   await page.evaluate((expectedVideoId) => {
     globalThis.__artifactDestinationDislikeTextObserver?.disconnect();
     const currentRoot = document.querySelector(
       `#fixture-page [data-fixture-page-kind="watch"][data-fixture-video-id="${expectedVideoId}"]`,
     );
-    const count = currentRoot?.querySelector(
+    const dislike = currentRoot?.querySelector(
       `#top-level-buttons-computed[data-fixture-watch-actions-replacement="${expectedVideoId}"] ` +
-        `[data-fixture-control-video-id="${expectedVideoId}"] [data-ryd-role="dislike"] #text`,
+        `[data-fixture-control-video-id="${expectedVideoId}"] [data-fixture-role="dislike"]`,
     );
-    if (!count) throw new Error(`The destination dislike text for ${expectedVideoId} is missing.`);
-    const read = () => (count.textContent ?? "").replace(/\s+/g, " ").trim();
+    if (!dislike) throw new Error(`The destination Dislike control for ${expectedVideoId} is missing.`);
+    const read = () => (dislike.querySelector("#text, [role='text']")?.textContent ?? "").replace(/\s+/g, " ").trim();
     globalThis.__artifactDestinationDislikeTexts = [read()];
     globalThis.__artifactDestinationDislikeTextObserver = new MutationObserver(() => {
       globalThis.__artifactDestinationDislikeTexts.push(read());
     });
-    globalThis.__artifactDestinationDislikeTextObserver.observe(count, {
+    globalThis.__artifactDestinationDislikeTextObserver.observe(dislike, {
       characterData: true,
       childList: true,
       subtree: true,
@@ -511,7 +978,7 @@ async function readSpaWatchSnapshot(page, runtime, fromVideoId, toVideoId) {
       );
       const controls = actionHost?.querySelector(`[data-fixture-control-video-id="${destinationVideoId}"]`);
       const countElement = controls?.querySelector(
-        '[data-ryd-role="dislike"] #text, [data-ryd-role="dislike"] [role="text"]',
+        '[data-fixture-role="dislike"] #text, [data-fixture-role="dislike"] [role="text"]',
       );
       const wrapper = actionHost?.querySelector(":scope > .ryd-tooltip");
       const container = wrapper?.querySelector(runtimeProfile.selectors.rateBarContainer);
@@ -596,7 +1063,7 @@ async function clickSpaDestinationDislike(page, videoId) {
   const selector =
     `#fixture-page [data-fixture-page-kind="watch"][data-fixture-video-id="${videoId}"] ` +
     `#top-level-buttons-computed[data-fixture-watch-actions-replacement="${videoId}"] ` +
-    `[data-fixture-control-video-id="${videoId}"] [data-ryd-role="dislike"] button`;
+    `[data-fixture-control-video-id="${videoId}"] [data-fixture-role="dislike"] button`;
   const buttons = page.locator(selector);
   assert.equal(await buttons.count(), 1, `Expected exactly one destination Dislike activation target for ${videoId}.`);
   const button = buttons.first();
@@ -608,6 +1075,76 @@ async function clickSpaDestinationDislike(page, videoId) {
   const ariaPressedBefore = await button.getAttribute("aria-pressed");
   await button.click();
   return { ariaPressedBefore, selector, videoId };
+}
+
+async function cloneRenderedSpaControlsAndActivateDislike(page, videoId) {
+  return page.evaluate((expectedVideoId) => {
+    const actionHost = document.querySelector(
+      `#fixture-page [data-fixture-page-kind="watch"][data-fixture-video-id="${expectedVideoId}"] ` +
+        `#top-level-buttons-computed[data-fixture-watch-actions-replacement="${expectedVideoId}"]`,
+    );
+    if (!actionHost) throw new Error(`The rendered destination action host for ${expectedVideoId} is missing.`);
+
+    const barSelector = "#ryd-bar, #return-youtube-dislike-bar";
+    const countSelector = '[data-fixture-role="dislike"] #text, [data-fixture-role="dislike"] [role="text"]';
+    const visible = (element) => {
+      if (!element?.isConnected) return false;
+      const bounds = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return (
+        bounds.width > 0 &&
+        bounds.height > 0 &&
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        Number.parseFloat(style.opacity) !== 0
+      );
+    };
+    const countBefore = actionHost.querySelector(countSelector)?.textContent?.trim() ?? null;
+    const barBefore = actionHost.querySelector(barSelector);
+    const buttonBefore = actionHost.querySelector('[data-fixture-role="dislike"] button');
+    if (!visible(actionHost) || !visible(countBefore === null ? null : actionHost.querySelector(countSelector))) {
+      throw new Error(`The destination count for ${expectedVideoId} is not visibly rendered before cloning.`);
+    }
+    if (!visible(barBefore) || !visible(buttonBefore)) {
+      throw new Error(
+        `The destination button and rate bar for ${expectedVideoId} are not visibly rendered before cloning.`,
+      );
+    }
+
+    const replacement = actionHost.cloneNode(true);
+    replacement.setAttribute("data-artifact-cloned-rendered-actions", "true");
+    actionHost.replaceWith(replacement);
+    const activationTarget = replacement.querySelector('[data-fixture-role="dislike"] button');
+    const count = replacement.querySelector(countSelector);
+    const bar = replacement.querySelector(barSelector);
+    if (!visible(replacement) || !visible(activationTarget) || !visible(count) || !visible(bar)) {
+      throw new Error(`The cloned destination presentation for ${expectedVideoId} is not visibly complete.`);
+    }
+
+    const ariaPressedBefore = activationTarget.getAttribute("aria-pressed");
+    let clickObservedAtDocument = false;
+    document.addEventListener(
+      "click",
+      (event) => {
+        clickObservedAtDocument = event.composedPath().includes(activationTarget);
+      },
+      { capture: true, once: true },
+    );
+    activationTarget.click();
+    return {
+      ariaDisabled: activationTarget.getAttribute("aria-disabled"),
+      ariaPressedAfterSynchronousClick: activationTarget.getAttribute("aria-pressed"),
+      ariaPressedBefore,
+      barCount: replacement.querySelectorAll(barSelector).length,
+      buttonDisabled: activationTarget.disabled,
+      clickObservedAtDocument,
+      countAfterSynchronousClick: count.textContent?.trim() ?? null,
+      countBefore,
+      countContainerCount: replacement.querySelectorAll(countSelector).length,
+      presentationCloned: replacement !== actionHost && !actionHost.isConnected,
+      videoId: expectedVideoId,
+    };
+  }, videoId);
 }
 
 function interactionRecordsSince(records, startIndex) {
@@ -641,7 +1178,14 @@ function readArtifactVoteHandshake(records, startIndex, videoId, value) {
     interactionCount: interactions.length,
     sharedUserId:
       typeof userId === "string" && userId.length > 0 && confirmation?.body?.userId === userId ? userId : null,
-    vote: vote ? { body: vote.body } : null,
+    vote: vote
+      ? {
+          body: vote.body,
+          responded: Number.isFinite(vote.respondedAt),
+          responseBody: vote.responseBody,
+          responseStatus: vote.responseStatus,
+        }
+      : null,
     voteCount: votes.length,
   };
 }
@@ -660,6 +1204,7 @@ function enqueueRecordedSuccessfulVoteResponses(backend) {
 }
 
 function isArtifactVoteHandshakeValid(snapshot) {
+  const isSuccessfulStatus = (status) => Number.isInteger(status) && status >= 200 && status < 300;
   if (
     snapshot.interactionCount !== 2 ||
     snapshot.voteCount !== 1 ||
@@ -667,44 +1212,35 @@ function isArtifactVoteHandshakeValid(snapshot) {
     typeof snapshot.sharedUserId !== "string" ||
     !/^[A-Za-z0-9]{36}$/.test(snapshot.sharedUserId) ||
     snapshot.interactionPaths?.join(",") !== "/interact/vote,/interact/confirmVote" ||
+    snapshot.vote?.responded !== true ||
+    !isSuccessfulStatus(snapshot.vote?.responseStatus) ||
     snapshot.confirmation?.responded !== true ||
-    snapshot.confirmation?.responseStatus !== 200 ||
+    !isSuccessfulStatus(snapshot.confirmation?.responseStatus) ||
     snapshot.confirmation?.responseBody !== true
   ) {
     return false;
   }
-  const voteBody = snapshot.vote?.body;
-  const confirmationBody = snapshot.confirmation?.body;
-  let solutionBytes = null;
-  try {
-    solutionBytes = Buffer.from(confirmationBody?.solution ?? "", "base64");
-  } catch {
-    // The validity result below reports malformed proof material without throwing from a polling predicate.
-  }
-  return (
-    voteBody?.userId === snapshot.sharedUserId &&
-    voteBody?.videoId === snapshot.expectedVideoId &&
-    voteBody?.value === snapshot.expectedValue &&
-    Object.keys(voteBody).sort().join(",") === "userId,value,videoId" &&
-    confirmationBody?.userId === snapshot.sharedUserId &&
-    confirmationBody?.videoId === snapshot.expectedVideoId &&
-    Object.keys(confirmationBody).sort().join(",") === "solution,userId,videoId" &&
-    typeof confirmationBody?.solution === "string" &&
-    solutionBytes?.length === 4
-  );
+  return isVoteProtocolBodyPairValid(snapshot.vote?.body, snapshot.confirmation?.body, {
+    value: snapshot.expectedValue,
+    videoId: snapshot.expectedVideoId,
+  });
 }
 
 function assertSpaStatsTraffic(backend, fromVideoId, toVideoId) {
-  const votesFor = (videoId) =>
-    backend.requestsFor("GET", "/votes").filter((request) => request.query.videoId === videoId);
-  assert.equal(votesFor(fromVideoId).length, 1, `Expected one stats request for outgoing video ${fromVideoId}.`);
-  assert.equal(votesFor(toVideoId).length, 1, `Expected one stats request for destination video ${toVideoId}.`);
+  const votes = assertExactSuccessfulVotesTraffic(
+    backend.requests,
+    [fromVideoId, toVideoId],
+    "The shared artifact SPA contract",
+  );
   assert.deepEqual(
     backend.blockedRequests,
     [],
     `The SPA scenario attempted unexpected network traffic: ${JSON.stringify(backend.blockedRequests)}`,
   );
-  return { fromVideoRequests: votesFor(fromVideoId).length, toVideoRequests: votesFor(toVideoId).length };
+  return {
+    fromVideoRequests: votes.filter((request) => request.query.videoId === fromVideoId).length,
+    toVideoRequests: votes.filter((request) => request.query.videoId === toVideoId).length,
+  };
 }
 
 function assertSpaBackendTraffic(backend, fromVideoId, toVideoId) {
@@ -733,7 +1269,7 @@ async function readWatchDiagnostics(page, runtime, videoId) {
       currentVideoId: document.querySelector("ytd-watch-flexy")?.getAttribute("video-id") ?? null,
       dislikeText:
         document
-          .querySelector('[data-ryd-role="dislike"] #text, [data-ryd-role="dislike"] [role="text"]')
+          .querySelector("dislike-button-view-model #text, dislike-button-view-model [role='text']")
           ?.textContent?.trim() ?? null,
       expectedVideoId,
       fillPresent: document.querySelector(rateBar) !== null,
@@ -749,11 +1285,13 @@ class HermeticUserscriptArtifactAdapter {
     artifactPath = DEFAULT_USERSCRIPT_ARTIFACT,
     backendOptions = {},
     browserType = chromium,
+    disableVoteSubmission = false,
     headless = true,
   } = {}) {
     this.artifactPath = path.resolve(artifactPath);
-    this.backendOptions = backendOptions;
+    this.backendOptions = createSharedArtifactBackendOptions(backendOptions);
     this.browserType = browserType;
+    this.disableVoteSubmission = disableVoteSubmission;
     this.headless = headless;
     this.profile = LIVE_RUNTIME_PROFILES.userscript;
     this.runtime = "userscript";
@@ -762,7 +1300,6 @@ class HermeticUserscriptArtifactAdapter {
   async start() {
     if (!fs.existsSync(this.artifactPath)) throw new Error(`Generated userscript is missing: ${this.artifactPath}`);
     this.backend = createFakeBackend(this.backendOptions);
-    enqueueRecordedSuccessfulVoteResponses(this.backend);
     this.browser = await this.browserType.launch({ headless: this.headless });
     this.context = await this.browser.newContext({ serviceWorkers: "block" });
     await installGmEnvironment(this.context);
@@ -773,12 +1310,18 @@ class HermeticUserscriptArtifactAdapter {
 
   async openWatch(videoId) {
     await openWatchFixture(this.page, videoId);
-    await this.page.addScriptTag({ path: this.artifactPath });
+    await injectGeneratedUserscript(this.page, {
+      artifactPath: this.artifactPath,
+      disableVoteSubmission: this.disableVoteSubmission,
+    });
   }
 
   async openSpaWatch(videoId) {
     await openNavigationFixture(this.page, { pageKind: "watch", videoId });
-    await this.page.addScriptTag({ path: this.artifactPath });
+    await injectGeneratedUserscript(this.page, {
+      artifactPath: this.artifactPath,
+      disableVoteSubmission: this.disableVoteSubmission,
+    });
   }
 
   async navigateSpaWatch(fromVideoId, toVideoId) {
@@ -788,9 +1331,55 @@ class HermeticUserscriptArtifactAdapter {
     return { destination, outgoing };
   }
 
+  deferNextStatsRequest() {
+    return this.backend.defer("GET", "/votes");
+  }
+
+  async navigateSpaWatchWhilePending(fromVideoId, toVideoId) {
+    const outgoing = await preparePendingSpaOutgoingControls(this.page, fromVideoId);
+    await this.page.locator("#watch-related").click();
+    const destination = await finishSpaDestinationReplacement(this.page, toVideoId);
+    await observeSpaDestinationDislikeText(this.page, toVideoId);
+    return { destination, outgoing };
+  }
+
+  async readDestinationDislikeTextHistory() {
+    return this.page.evaluate(() => [...(globalThis.__artifactDestinationDislikeTexts ?? [])]);
+  }
+
+  deferInteractionResponse(pathname) {
+    return this.backend.defer("POST", pathname);
+  }
+
+  enqueueInteractionResponse(pathname, response) {
+    this.backend.enqueue("POST", pathname, response);
+  }
+
+  async setVoteSubmissionDisabled(disabled) {
+    this.disableVoteSubmission = disabled === true;
+  }
+
+  readInteractionRecords() {
+    return this.backend.requests;
+  }
+
+  readStatsRequestTimings() {
+    return this.backend.requestsFor("GET", "/votes").map(({ at, query, respondedAt }) => ({
+      at,
+      query: { ...query },
+      respondedAt,
+    }));
+  }
+
   async activateSpaDislike(videoId) {
     const interactionStartIndex = this.backend.requests.length;
     const activation = await clickSpaDestinationDislike(this.page, videoId);
+    return { ...activation, interactionStartIndex };
+  }
+
+  async activateClonedSpaDislike(videoId) {
+    const interactionStartIndex = this.backend.requests.length;
+    const activation = await cloneRenderedSpaControlsAndActivateDislike(this.page, videoId);
     return { ...activation, interactionStartIndex };
   }
 
@@ -861,45 +1450,101 @@ class HermeticExtensionArtifactAdapter {
     backendOptions = {},
     browserType = chromium,
     channel = "chromium",
+    contextOptions = {},
     headless = true,
+    selectorResponse = { body: { rateBar: { oldDesignActions: ["#top-level-buttons-computed"] } } },
   } = {}) {
     if (!apiServer?.origin) throw new TypeError("The extension adapter requires a running hermetic API server.");
     this.apiServer = apiServer;
     this.artifactDirectory = path.resolve(artifactDirectory);
-    this.backendOptions = backendOptions;
+    this.backendOptions = createSharedArtifactBackendOptions(backendOptions);
     this.browserType = browserType;
     this.channel = channel;
+    this.contextOptions = contextOptions;
     this.headless = headless;
+    this.selectorResponse = selectorResponse;
     this.profile = LIVE_RUNTIME_PROFILES.extension;
     this.runtime = "extension";
   }
 
   async start() {
+    this.artifactContract = readGeneratedMv3Contract(this.artifactDirectory);
     this.backend = createFakeBackend(this.backendOptions);
-    this.backend.enqueue("GET", "/configs/selectors", {
-      body: { rateBar: { oldDesignActions: ["#top-level-buttons-computed"] } },
-    });
+    if (this.selectorResponse !== null) {
+      this.backend.enqueue("GET", "/configs/selectors", this.selectorResponse);
+    }
     this.apiRecordStart = this.apiServer.records.length;
     this.preparedArtifact = prepareHermeticExtensionArtifact(this.artifactDirectory, this.apiServer.origin);
     this.profileDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "ryd-mv3-profile-"));
     const extensionPath = this.preparedArtifact.extensionDirectory;
     this.context = await this.browserType.launchPersistentContext(this.profileDirectory, {
-      args: [`--disable-extensions-except=${extensionPath}`, `--load-extension=${extensionPath}`, "--no-first-run"],
+      ...this.contextOptions,
+      args: [
+        `--disable-extensions-except=${extensionPath}`,
+        `--load-extension=${extensionPath}`,
+        "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE localhost, EXCLUDE 127.0.0.1",
+        "--no-first-run",
+      ],
       channel: this.channel,
       headless: this.headless,
       serviceWorkers: "allow",
     });
     await installArtifactRoutes(this.context, this.backend, { passthroughOrigin: this.apiServer.origin });
 
-    this.worker = this.context.serviceWorkers()[0];
-    if (!this.worker) this.worker = await this.context.waitForEvent("serviceworker", { timeout: 15_000 });
-    assert.match(this.worker.url(), /^chrome-extension:\/\//, "The real MV3 background worker did not start.");
+    const isArtifactWorker = (worker) => new URL(worker.url()).pathname === this.artifactContract.serviceWorkerPath;
+    this.worker = this.context.serviceWorkers().find(isArtifactWorker);
+    if (!this.worker) {
+      this.worker = await this.context.waitForEvent("serviceworker", {
+        predicate: isArtifactWorker,
+        timeout: 15_000,
+      });
+    }
+    const workerUrl = new URL(this.worker.url());
+    assert.equal(workerUrl.protocol, "chrome-extension:", "The real MV3 background worker did not start.");
+    assert.match(workerUrl.hostname, /^[a-p]{32}$/, "The MV3 worker has no valid generated extension ID.");
+    assert.equal(
+      workerUrl.pathname,
+      this.artifactContract.serviceWorkerPath,
+      "Chromium started a different extension worker than the generated artifact declares.",
+    );
+    this.extensionId = workerUrl.hostname;
+    this.workerSignals = createWorkerSignalCollector(this.worker, this.apiServer);
     this.page = await this.context.newPage();
-    this.pageSignals = await createPageSignalCollector(this.page, this.runtime);
+    const pageSignals = await createPageSignalCollector(this.page, this.runtime);
+    this.pageSignals = combineExtensionSignalCollectors(pageSignals, this.workerSignals);
   }
 
   async openWatch(videoId) {
     await openWatchFixture(this.page, videoId);
+  }
+
+  async setPremiumTeaserHidden(hidden) {
+    const stored = await this.worker.evaluate(async (value) => {
+      // Wait for the background's initial default write before applying the
+      // scenario preference; otherwise its pending write can replace our value.
+      await new Promise((resolve, reject) => {
+        const finish = (error) => {
+          clearTimeout(timeout);
+          chrome.storage.onChanged.removeListener(changed);
+          if (error) reject(error);
+          else resolve();
+        };
+        const changed = (changes, area) => {
+          if (area === "sync" && changes.hidePremiumTeaser?.newValue !== undefined) finish();
+        };
+        const timeout = setTimeout(
+          () => finish(new Error("The extension did not initialize hidePremiumTeaser.")),
+          2_000,
+        );
+        chrome.storage.onChanged.addListener(changed);
+        chrome.storage.sync.get(["hidePremiumTeaser"]).then((state) => {
+          if (state.hidePremiumTeaser !== undefined) finish();
+        }, finish);
+      });
+      await chrome.storage.sync.set({ hidePremiumTeaser: value });
+      return (await chrome.storage.sync.get(["hidePremiumTeaser"])).hidePremiumTeaser;
+    }, hidden === true);
+    assert.equal(stored, hidden === true, "The premium teaser preference was not stored.");
   }
 
   async openSpaWatch(videoId) {
@@ -909,7 +1554,9 @@ class HermeticExtensionArtifactAdapter {
   async navigateSpaWatch(fromVideoId, toVideoId) {
     const outgoing = await prepareSpaOutgoingControls(this.page, fromVideoId);
     await this.page.locator("#watch-related").click();
-    const destination = await finishSpaDestinationReplacement(this.page, toVideoId);
+    const destination = await finishSpaDestinationReplacement(this.page, toVideoId, {
+      nativeHydrationDelay: ARTIFACT_NATIVE_HYDRATION_DELAY_MS,
+    });
     return { destination, outgoing };
   }
 
@@ -919,10 +1566,44 @@ class HermeticExtensionArtifactAdapter {
 
   async navigateSpaWatchWhilePending(fromVideoId, toVideoId) {
     const outgoing = await preparePendingSpaOutgoingControls(this.page, fromVideoId);
+    await finishSpaDestinationReplacement(this.page, toVideoId, {
+      beforeNavigation: true,
+      nativeHydrationDelay: ARTIFACT_NATIVE_HYDRATION_DELAY_MS,
+    });
     await this.page.locator("#watch-related").click();
-    const destination = await finishSpaDestinationReplacement(this.page, toVideoId);
+    const destination = await this.page.evaluate(() => {
+      const result = globalThis.__artifactPreparedDestinationReplacement;
+      delete globalThis.__artifactPreparedDestinationReplacement;
+      if (!result) throw new Error("The destination controls were not prepared during navigation.");
+      return result;
+    });
     await observeSpaDestinationDislikeText(this.page, toVideoId);
     return { destination, outgoing };
+  }
+
+  deferInteractionResponse(pathname) {
+    return this.apiServer.defer("POST", pathname);
+  }
+
+  enqueueInteractionResponse(pathname, response) {
+    this.apiServer.enqueue("POST", pathname, response);
+  }
+
+  readInteractionRecords() {
+    return this.apiServer.records.slice(this.apiRecordStart);
+  }
+
+  async setVoteSubmissionDisabled(disabled) {
+    await this.worker.evaluate(async (value) => {
+      const deadline = Date.now() + 2_000;
+      while ((await chrome.storage.sync.get(["disableVoteSubmission"])).disableVoteSubmission === undefined) {
+        if (Date.now() >= deadline) throw new Error("The extension did not initialize disableVoteSubmission.");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      await chrome.storage.sync.set({ disableVoteSubmission: value });
+      const stored = (await chrome.storage.sync.get(["disableVoteSubmission"])).disableVoteSubmission;
+      if (stored !== value) throw new Error("The extension did not persist disableVoteSubmission.");
+    }, disabled === true);
   }
 
   async readDestinationDislikeTextHistory() {
@@ -940,6 +1621,12 @@ class HermeticExtensionArtifactAdapter {
   async activateSpaDislike(videoId) {
     const interactionStartIndex = this.apiServer.records.length;
     const activation = await clickSpaDestinationDislike(this.page, videoId);
+    return { ...activation, interactionStartIndex };
+  }
+
+  async activateClonedSpaDislike(videoId) {
+    const interactionStartIndex = this.apiServer.records.length;
+    const activation = await cloneRenderedSpaControlsAndActivateDislike(this.page, videoId);
     return { ...activation, interactionStartIndex };
   }
 
@@ -1056,6 +1743,18 @@ async function runArtifactWatchRenderScenario(adapter, { videoId = VIDEO_A } = {
     await adapter.openWatch(videoId);
     const result = await adapter.waitForWatchResult(videoId);
     assert.equal(result.videoId, videoId);
+    assert.equal(
+      result.ownedByExpectedWatch,
+      true,
+      `${adapter.runtime} rendered the result outside the expected watch root.`,
+    );
+    assert.equal(
+      result.sameActionSurface,
+      true,
+      `${adapter.runtime} rendered the count and bar in different action surfaces.`,
+    );
+    assert.equal(result.actionSurfaceVisible, true, `${adapter.runtime} rendered into a hidden watch action surface.`);
+    assert.equal(result.countVisible, true, `${adapter.runtime} rendered a hidden dislike count.`);
     assert.equal(result.rateBarVisible, true, `${adapter.runtime} did not render a visible watch ratio bar.`);
     assert.equal(result.fillVisible, true, `${adapter.runtime} did not render a visible watch ratio fill.`);
     assert.match(result.count, /\d/, `${adapter.runtime} did not render a numeric dislike count.`);
@@ -1169,6 +1868,14 @@ async function runArtifactWatchSpaSetup(adapter, configuration) {
     `${adapter.runtime} destination watch first became valid after ${readiness.firstValidMs}ms; ` +
       `the budget is ${maxFirstValidMs}ms.`,
   );
+  if (mutation.destination.nativeHydrationDelay > 0) {
+    assert.ok(readiness.invalidSamples > 0, `${adapter.runtime} became valid before delayed controls hydrated.`);
+    assert.ok(
+      readiness.firstValidMs >= mutation.destination.nativeHydrationDelay - intervalMs * 2,
+      `${adapter.runtime} became valid after ${readiness.firstValidMs}ms, before the ` +
+        `${mutation.destination.nativeHydrationDelay}ms native-control delay elapsed.`,
+    );
+  }
   const stability = await assertInvariantContinuously({
     durationMs: stabilityDurationMs,
     intervalMs,
@@ -1231,16 +1938,24 @@ async function runArtifactWatchSpaScenario(adapter, options = {}) {
   }
 }
 
-async function runArtifactWatchSpaVoteScenario(
+async function runArtifactWatchSpaVoteContract(
   adapter,
-  { handshakeStableForMs = 1_000, handshakeTimeoutMs = 10_000, voteValue = -1, ...spaOptions } = {},
+  {
+    activationMethod,
+    expectClonedPresentation = false,
+    handshakeStableForMs = 1_000,
+    handshakeTimeoutMs = 10_000,
+    scenarioId,
+    voteValue = -1,
+    ...spaOptions
+  },
 ) {
   assert.ok(
-    SHARED_ARTIFACT_SCENARIO_IDS.includes(ARTIFACT_WATCH_SPA_VOTE_SCENARIO_ID),
-    `${ARTIFACT_WATCH_SPA_VOTE_SCENARIO_ID} must remain in the shared artifact scenario catalog.`,
+    SHARED_ARTIFACT_SCENARIO_IDS.includes(scenarioId),
+    `${scenarioId} must remain in the shared artifact scenario catalog.`,
   );
   assertArtifactRuntimeAdapter(adapter, [
-    "activateSpaDislike",
+    activationMethod,
     "assertNoPageSignals",
     "assertSpaVoteNetwork",
     "close",
@@ -1257,12 +1972,31 @@ async function runArtifactWatchSpaVoteScenario(
   try {
     await adapter.start();
     const result = await runArtifactWatchSpaSetup(adapter, configuration);
-    const activation = await adapter.activateSpaDislike(configuration.toVideoId);
+    const activation = await adapter[activationMethod](configuration.toVideoId);
     assert.ok(
       Number.isInteger(activation.interactionStartIndex) && activation.interactionStartIndex >= 0,
       "The adapter did not return a valid interaction record boundary.",
     );
     assert.equal(activation.videoId, configuration.toVideoId, "The adapter activated the wrong destination video.");
+    if (expectClonedPresentation) {
+      assert.equal(activation.presentationCloned, true, "The initialized destination presentation was not cloned.");
+      assert.equal(activation.barCount, 1, "The cloned destination did not visibly retain exactly one rate bar.");
+      assert.equal(
+        activation.countContainerCount,
+        1,
+        "The cloned destination did not visibly retain exactly one Dislike count.",
+      );
+      assert.equal(
+        activation.countBefore,
+        String(configuration.toCounts.dislikes),
+        "The cloned destination did not start from the rendered destination Dislike count.",
+      );
+      assert.equal(
+        activation.countAfterSynchronousClick,
+        String(configuration.toCounts.dislikes + 1),
+        `The first immediate click on cloned initialized controls was lost: ${JSON.stringify(activation)}`,
+      );
+    }
 
     let handshake;
     try {
@@ -1286,11 +2020,15 @@ async function runArtifactWatchSpaVoteScenario(
       configuration.toVideoId,
       activation.interactionStartIndex,
     );
-    await adapter.assertNoPageSignals(ARTIFACT_WATCH_SPA_VOTE_SCENARIO_ID);
+    await adapter.assertNoPageSignals(scenarioId);
 
     return {
       ...result,
-      activation: { ariaPressedBefore: activation.ariaPressedBefore, videoId: activation.videoId },
+      activation: {
+        ariaPressedBefore: activation.ariaPressedBefore,
+        presentationCloned: activation.presentationCloned === true,
+        videoId: activation.videoId,
+      },
       handshake: {
         confirmationRequests: handshakeSnapshot.confirmationCount,
         confirmationStatus: handshakeSnapshot.confirmation.responseStatus,
@@ -1302,10 +2040,12 @@ async function runArtifactWatchSpaVoteScenario(
         userId: handshakeSnapshot.sharedUserId,
         value: voteValue,
         videoId: configuration.toVideoId,
+        voteResponded: handshakeSnapshot.vote.responded,
         voteRequests: handshakeSnapshot.voteCount,
+        voteStatus: handshakeSnapshot.vote.responseStatus,
       },
       runtime: adapter.runtime,
-      scenarioId: ARTIFACT_WATCH_SPA_VOTE_SCENARIO_ID,
+      scenarioId,
       traffic: {
         ...network,
         confirmationRequests: handshakeSnapshot.confirmationCount,
@@ -1318,9 +2058,31 @@ async function runArtifactWatchSpaVoteScenario(
   }
 }
 
+async function runArtifactWatchSpaVoteScenario(adapter, options = {}) {
+  return runArtifactWatchSpaVoteContract(adapter, {
+    ...options,
+    activationMethod: "activateSpaDislike",
+    scenarioId: ARTIFACT_WATCH_SPA_VOTE_SCENARIO_ID,
+  });
+}
+
+async function runArtifactWatchSpaClonedVoteScenario(adapter, options = {}) {
+  return runArtifactWatchSpaVoteContract(adapter, {
+    ...options,
+    activationMethod: "activateClonedSpaDislike",
+    expectClonedPresentation: true,
+    scenarioId: ARTIFACT_WATCH_SPA_CLONED_VOTE_SCENARIO_ID,
+  });
+}
+
 async function runExtensionDelayedOutgoingFailureScenario(
   adapter,
-  { fromVideoId = VIDEO_A, maxDestinationRequestDelayMs = 250, requestTimeoutMs = 5_000, toVideoId = VIDEO_B } = {},
+  {
+    fromVideoId = VIDEO_A,
+    maxDestinationRequestReadyDelayMs = 250,
+    requestTimeoutMs = 5_000,
+    toVideoId = VIDEO_B,
+  } = {},
 ) {
   assert.equal(adapter?.runtime, "extension", "The delayed outgoing failure scenario requires the extension runtime.");
   assertArtifactRuntimeAdapter(adapter, [
@@ -1333,6 +2095,7 @@ async function runExtensionDelayedOutgoingFailureScenario(
     "readDestinationDislikeTextHistory",
     "readSpaWatchSnapshot",
     "readStatsRequestTimings",
+    "setPremiumTeaserHidden",
     "start",
     "waitForWatchResult",
   ]);
@@ -1340,6 +2103,11 @@ async function runExtensionDelayedOutgoingFailureScenario(
 
   try {
     await adapter.start();
+    // This scenario times native-controls initialization. The optional teaser can
+    // fetch counts before hydration and share that request with the main renderer,
+    // so hide it before loading either video to keep /votes timing attributable.
+    // The shared SPA scenarios retain the default teaser-enabled configuration.
+    await adapter.setPremiumTeaserHidden(true);
     const outgoingRequest = adapter.deferNextStatsRequest();
     await adapter.openSpaWatch(fromVideoId);
     let requestTimeout;
@@ -1384,10 +2152,17 @@ async function runExtensionDelayedOutgoingFailureScenario(
     const destinationRequests = timings.filter((record) => record.query.videoId === toVideoId);
     assert.equal(destinationRequests.length, 1, `Expected one destination stats request for ${toVideoId}.`);
     const destinationRequestDelayMs = destinationRequests[0].at - releasedAt;
+    const destinationControlsReadyAt =
+      mutation.destination.nativeHydrationStartedAt + mutation.destination.nativeHydrationDelay;
+    const destinationRequestReadyDelayMs = destinationRequests[0].at - destinationControlsReadyAt;
     assert.ok(
-      destinationRequestDelayMs <= maxDestinationRequestDelayMs,
-      `The queued destination initialization waited ${destinationRequestDelayMs}ms after A settled; ` +
-        `the budget is ${maxDestinationRequestDelayMs}ms.`,
+      destinationRequestReadyDelayMs >= 0,
+      `The destination stats request started ${-destinationRequestReadyDelayMs}ms before its controls hydrated.`,
+    );
+    assert.ok(
+      destinationRequestReadyDelayMs <= maxDestinationRequestReadyDelayMs,
+      `The queued destination initialization waited ${destinationRequestReadyDelayMs}ms after its controls hydrated; ` +
+        `the budget is ${maxDestinationRequestReadyDelayMs}ms.`,
     );
     const traffic = await adapter.assertSpaNetwork(fromVideoId, toVideoId);
     await adapter.assertNoPageSignals(ARTIFACT_EXTENSION_DELAYED_FAILURE_SCENARIO_ID);
@@ -1399,6 +2174,7 @@ async function runExtensionDelayedOutgoingFailureScenario(
         videoId: destination.currentVideoId,
       },
       destinationRequestDelayMs,
+      destinationRequestReadyDelayMs,
       runtime: adapter.runtime,
       scenarioId: ARTIFACT_EXTENSION_DELAYED_FAILURE_SCENARIO_ID,
       textHistory,
@@ -1409,34 +2185,39 @@ async function runExtensionDelayedOutgoingFailureScenario(
   }
 }
 
+function createCataloguedArtifactAdapter(runtime, scenarioId, apiServer) {
+  const backendOptions = scenarioId === ARTIFACT_SMOKE_SCENARIO_ID ? undefined : { countsByVideo: SPA_COUNTS };
+  const options = backendOptions ? { backendOptions } : {};
+  if (runtime === "userscript") return new HermeticUserscriptArtifactAdapter(options);
+  if (runtime === "extension") return new HermeticExtensionArtifactAdapter({ ...options, apiServer });
+  throw new TypeError(`Unsupported catalogued artifact runtime: ${runtime}`);
+}
+
+function runCataloguedArtifactScenario(scenarioId, adapter) {
+  switch (scenarioId) {
+    case ARTIFACT_SMOKE_SCENARIO_ID:
+      return runArtifactWatchRenderScenario(adapter);
+    case ARTIFACT_WATCH_SPA_SCENARIO_ID:
+      return runArtifactWatchSpaScenario(adapter);
+    case ARTIFACT_WATCH_SPA_VOTE_SCENARIO_ID:
+      return runArtifactWatchSpaVoteScenario(adapter);
+    case ARTIFACT_WATCH_SPA_CLONED_VOTE_SCENARIO_ID:
+      return runArtifactWatchSpaClonedVoteScenario(adapter);
+    case ARTIFACT_EXTENSION_DELAYED_FAILURE_SCENARIO_ID:
+      return runExtensionDelayedOutgoingFailureScenario(adapter);
+    default:
+      throw new TypeError(`Unknown catalogued artifact scenario: ${scenarioId}`);
+  }
+}
+
 async function runBothArtifactSmokes() {
   const apiServer = await startHermeticApiServer();
   try {
     const results = [];
-    for (const adapter of [
-      new HermeticUserscriptArtifactAdapter(),
-      new HermeticExtensionArtifactAdapter({ apiServer }),
-    ]) {
-      results.push(await runArtifactWatchRenderScenario(adapter));
+    for (const { runtime, scenarioId } of createArtifactBrowserScenarioPlan()) {
+      const adapter = createCataloguedArtifactAdapter(runtime, scenarioId, apiServer);
+      results.push(await runCataloguedArtifactScenario(scenarioId, adapter));
     }
-    const backendOptions = { countsByVideo: SPA_COUNTS };
-    for (const adapter of [
-      new HermeticUserscriptArtifactAdapter({ backendOptions }),
-      new HermeticExtensionArtifactAdapter({ apiServer, backendOptions }),
-    ]) {
-      results.push(await runArtifactWatchSpaScenario(adapter));
-    }
-    for (const adapter of [
-      new HermeticUserscriptArtifactAdapter({ backendOptions }),
-      new HermeticExtensionArtifactAdapter({ apiServer, backendOptions }),
-    ]) {
-      results.push(await runArtifactWatchSpaVoteScenario(adapter));
-    }
-    results.push(
-      await runExtensionDelayedOutgoingFailureScenario(
-        new HermeticExtensionArtifactAdapter({ apiServer, backendOptions }),
-      ),
-    );
     return results;
   } finally {
     await apiServer.close();
@@ -1453,21 +2234,30 @@ if (require.main === module) {
 }
 
 module.exports = {
+  ARTIFACT_BROWSER_SCENARIO_CATALOG,
   ARTIFACT_EXTENSION_DELAYED_FAILURE_SCENARIO_ID,
   ARTIFACT_SMOKE_SCENARIO_ID,
+  ARTIFACT_WATCH_SPA_CLONED_VOTE_SCENARIO_ID,
   ARTIFACT_WATCH_SPA_SCENARIO_ID,
   ARTIFACT_WATCH_SPA_VOTE_SCENARIO_ID,
   HermeticExtensionArtifactAdapter,
   HermeticUserscriptArtifactAdapter,
   SHARED_ARTIFACT_SCENARIO_IDS,
+  SHARED_ARTIFACT_RUNTIMES,
   SPA_COUNTS,
   assertLoopbackOrigin,
+  assertArtifactBrowserScenarioCatalog,
+  createArtifactBrowserScenarioPlan,
   createPageSignalCollector,
+  createSharedArtifactBackendOptions,
+  createWorkerSignalCollector,
   isArtifactVoteHandshakeValid,
   isSpaDestinationValid,
   prepareHermeticExtensionArtifact,
+  readGeneratedMv3Contract,
   readArtifactVoteHandshake,
   runArtifactWatchRenderScenario,
+  runArtifactWatchSpaClonedVoteScenario,
   runArtifactWatchSpaScenario,
   runArtifactWatchSpaVoteScenario,
   runBothArtifactSmokes,

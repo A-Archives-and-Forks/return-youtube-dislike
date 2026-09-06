@@ -49,8 +49,8 @@ async function expectWatchInitialized(page, videoId, expectedDislikes = COUNTS[v
   const expectedCount = String(expectedDislikes);
   await expect(page).toHaveURL((url) => url.pathname === "/watch" && url.searchParams.get("v") === videoId);
   await expect(page.locator(`ytd-watch-flexy[video-id="${videoId}"]`)).toHaveCount(1);
-  await expect(page.locator('[data-fixture-page-kind="watch"] [data-ryd-role="buttons"]')).toHaveCount(1);
-  await expect(page.locator('[data-fixture-page-kind="watch"] [data-ryd-role="dislike"] #text')).toHaveText(
+  await expect(page.locator('[data-fixture-page-kind="watch"] [data-fixture-role="buttons"]')).toHaveCount(1);
+  await expect(page.locator('[data-fixture-page-kind="watch"] [data-fixture-role="dislike"] #text')).toHaveText(
     expectedCount,
   );
   await expect(page.locator("#return-youtube-dislike-bar-container")).toHaveCount(1);
@@ -66,7 +66,7 @@ async function expectShortInitialized(page, videoId, expectedDislikes = COUNTS[v
   await expect(page.locator("ytd-shorts")).toHaveCount(1);
   await expect(activeRenderer).toHaveCount(1);
   await expect(
-    page.locator('ytd-reel-video-renderer[is-active] reel-action-bar-view-model[data-ryd-role="buttons"]'),
+    page.locator('ytd-reel-video-renderer[is-active] reel-action-bar-view-model[data-fixture-role="buttons"]'),
   ).toHaveCount(1);
   const syntheticDislike = activeRenderer.locator("[data-ryd-synthetic-shorts-dislike]");
   await expect(syntheticDislike).toHaveCount(1);
@@ -85,9 +85,9 @@ async function expectMobileShortInitialized(page, videoId, expectedDislikes = CO
   await expect(activeShort).toHaveCount(1);
   await expect(activeShort).toBeVisible();
   await expect(page.locator("[data-fixture-mobile-short][is-active]:visible")).toHaveCount(1);
-  await expect(activeShort.locator('ytm-like-button-renderer[data-ryd-role="buttons"]')).toHaveCount(1);
-  await expect(activeShort.locator('[data-ryd-role="dislike"] #text')).toHaveText(String(expectedDislikes));
-  await expect(activeShort.locator('[data-ryd-role="dislike"] button')).toBeEnabled();
+  await expect(activeShort.locator('ytm-like-button-renderer[data-fixture-role="buttons"]')).toHaveCount(1);
+  await expect(activeShort.locator('[data-fixture-role="dislike"] #text')).toHaveText(String(expectedDislikes));
+  await expect(activeShort.locator('[data-fixture-role="dislike"] button')).toBeEnabled();
   await expect(page.locator("[data-ryd-synthetic-shorts-dislike]")).toHaveCount(0);
   await expect(page.locator("#return-youtube-dislike-bar-container")).toHaveCount(0);
 }
@@ -95,7 +95,9 @@ async function expectMobileShortInitialized(page, videoId, expectedDislikes = CO
 async function expectOneActivation(page, backend, videoId) {
   const voteCount = backend.requestsFor("POST", "/interact/vote").length;
   const confirmationCount = backend.requestsFor("POST", "/interact/confirmVote").length;
-  await page.locator('[data-ryd-role="dislike"]:visible button').click();
+  await page
+    .locator('[data-fixture-role="dislike"]:visible button, [data-ryd-synthetic-shorts-dislike]:visible button')
+    .click();
   await expect.poll(() => backend.requestsFor("POST", "/interact/confirmVote").length).toBe(confirmationCount + 1);
   await page.waitForTimeout(600);
 
@@ -125,7 +127,7 @@ test("cold channel reload then immediate Short link initializes delayed Shorts c
   await page.locator("#channel-short").click();
 
   await expect(page).toHaveURL((url) => url.pathname === `/shorts/${VIDEO_A}`);
-  const decoyDislikeCount = page.locator('[data-fixture-decoy-controls] [data-ryd-role="dislike"] #text');
+  const decoyDislikeCount = page.locator('[data-fixture-decoy-controls] [data-fixture-role="dislike"] #text');
   await page.waitForTimeout(250);
   await expect(decoyDislikeCount).toHaveText("");
   await expect(page.locator("[data-ryd-synthetic-shorts-dislike]")).toHaveCount(0);
@@ -320,9 +322,9 @@ test("watch to Short link switches page kind, identity, and controls", async ({ 
   await page.locator("#watch-to-short").click();
 
   await expect(page).toHaveURL((url) => url.pathname === `/shorts/${VIDEO_B}`);
-  await expect(page.locator('[data-fixture-page-kind="watch"] [data-ryd-role="dislike"] #text')).toHaveText("11");
+  await expect(page.locator('[data-fixture-page-kind="watch"] [data-fixture-role="dislike"] #text')).toHaveText("11");
   await page.waitForTimeout(50);
-  await expect(page.locator('[data-fixture-page-kind="watch"] [data-ryd-role="dislike"] #text')).toHaveText("11");
+  await expect(page.locator('[data-fixture-page-kind="watch"] [data-fixture-role="dislike"] #text')).toHaveText("11");
   await expect(page.locator("[data-ryd-synthetic-shorts-dislike]")).toHaveCount(0);
 
   await expectShortInitialized(page, VIDEO_B);
@@ -415,8 +417,8 @@ test("delayed mobile Short navigation never binds the outgoing renderer to the t
   await expect(outgoingRenderer.locator(`a[href="/shorts/${VIDEO_B}"]`)).toHaveCount(1);
   await expect(page.locator(`ytm-reel-video-renderer[video-id="${VIDEO_B}"]`)).toHaveCount(0);
   await page.waitForTimeout(600);
-  await expect(outgoingRenderer.locator('[data-ryd-role="dislike"] #text')).toHaveText("11");
-  await outgoingRenderer.locator('[data-ryd-role="dislike"] button').click();
+  await expect(outgoingRenderer.locator('[data-fixture-role="dislike"] #text')).toHaveText("11");
+  await outgoingRenderer.locator('[data-fixture-role="dislike"] button').click();
   await page.waitForTimeout(100);
   expect(
     harness.backend.requestsFor("GET", "/votes").filter((request) => request.query.videoId === VIDEO_B),
@@ -561,7 +563,7 @@ test("watch SPA navigation refreshes one aligned ratio bar with the target video
   await expect(wrapper).toBeVisible();
   await expect(container).toBeVisible();
   await expect(bar).toBeVisible();
-  await expect(currentControls.locator('[data-ryd-role="dislike"] #text')).toHaveText("22");
+  await expect(currentControls.locator('[data-fixture-role="dislike"] #text')).toHaveText("22");
   await expect(tooltip).toContainText("200 / 22");
   await expect(tooltip).toBeHidden();
 
@@ -578,8 +580,8 @@ test("watch SPA navigation refreshes one aligned ratio bar with the target video
       };
     };
     const controls = reactionRegion.querySelector("[data-fixture-control-video-id]");
-    const like = controls.querySelector('[data-ryd-role="like"] button');
-    const dislike = controls.querySelector('[data-ryd-role="dislike"] button');
+    const like = controls.querySelector('[data-fixture-role="like"] button');
+    const dislike = controls.querySelector('[data-fixture-role="dislike"] button');
     const ratioWrapper = reactionRegion.querySelector(":scope > .ryd-tooltip");
     const ratioContainer = ratioWrapper.querySelector("#return-youtube-dislike-bar-container");
     const ratioFill = ratioContainer.querySelector("#return-youtube-dislike-bar");
@@ -651,7 +653,7 @@ test("a pruned current watch ratio bar is restored once with the current video's
   await expect(wrapper).toBeVisible();
   await expect(container).toBeVisible();
   await expect(bar).toBeVisible();
-  await expect(currentControls.locator('[data-ryd-role="dislike"] #text')).toHaveText("22");
+  await expect(currentControls.locator('[data-fixture-role="dislike"] #text')).toHaveText("22");
   await expect(tooltip).toContainText("200 / 22");
   await expect(tooltip).toBeHidden();
   expect(await wrapper.evaluate((restoredWrapper) => restoredWrapper !== globalThis.__fixturePrunedWatchBar)).toBe(
@@ -787,8 +789,8 @@ test("delayed watch navigation never binds outgoing controls to the target video
   await expect(outgoingControls.locator('[data-fixture-irrelevant-watch-count-mutation="true"]')).toHaveCount(1);
   await expect(page.locator('[data-fixture-irrelevant-watch-tooltip-mutation="true"]')).toHaveCount(1);
   await page.waitForTimeout(600);
-  await expect(outgoingControls.locator('[data-ryd-role="dislike"] #text')).toHaveText("11");
-  await outgoingControls.locator('[data-ryd-role="dislike"] button').click();
+  await expect(outgoingControls.locator('[data-fixture-role="dislike"] #text')).toHaveText("11");
+  await outgoingControls.locator('[data-fixture-role="dislike"] button').click();
   await page.waitForTimeout(100);
   expect(
     harness.backend.requestsFor("GET", "/votes").filter((request) => request.query.videoId === VIDEO_B),
@@ -796,7 +798,7 @@ test("delayed watch navigation never binds outgoing controls to the target video
   expect(harness.backend.requestsFor("POST", "/interact/vote")).toHaveLength(0);
   expect(harness.backend.requestsFor("POST", "/interact/confirmVote")).toHaveLength(0);
 
-  const outgoingDislike = outgoingControls.locator('[data-ryd-role="dislike"]');
+  const outgoingDislike = outgoingControls.locator('[data-fixture-role="dislike"]');
   await page.evaluate(() => window.__navigationFixture.replaceDelayedWatchControl("like"));
   await expect(outgoingControls.locator('[data-fixture-watch-replacement="like"]')).toHaveCount(1);
   await expect(outgoingDislike).toBeVisible();
@@ -826,8 +828,8 @@ test("same-node watch reuse requires independent native refresh on both activati
   const harness = await launchNavigationHarness({ context, page }, { pageKind: "watch", videoId: VIDEO_A });
   await expectWatchInitialized(page, VIDEO_A);
   const reusedControls = page.locator(`[data-fixture-control-video-id="${VIDEO_A}"]`);
-  const reusedLikeButton = reusedControls.locator('[data-ryd-role="like"] button');
-  const reusedDislikeButton = reusedControls.locator('[data-ryd-role="dislike"] button');
+  const reusedLikeButton = reusedControls.locator('[data-fixture-role="like"] button');
+  const reusedDislikeButton = reusedControls.locator('[data-fixture-role="dislike"] button');
   await reusedLikeButton.evaluate((button) => button.setAttribute("data-fixture-same-node", "like"));
   await reusedDislikeButton.evaluate((button) => button.setAttribute("data-fixture-same-node", "dislike"));
 
@@ -836,7 +838,7 @@ test("same-node watch reuse requires independent native refresh on both activati
 
   await expect(page).toHaveURL((url) => url.pathname === "/watch" && url.searchParams.get("v") === VIDEO_B);
   await page.waitForTimeout(600);
-  await expect(reusedControls.locator('[data-ryd-role="dislike"] #text')).toHaveText("11");
+  await expect(reusedControls.locator('[data-fixture-role="dislike"] #text')).toHaveText("11");
   await reusedDislikeButton.click();
   await page.waitForTimeout(100);
   expect(
@@ -875,8 +877,8 @@ test("pre-navigation native drift cannot satisfy same-node watch refresh for the
   const harness = await launchNavigationHarness({ context, page }, { pageKind: "watch", videoId: VIDEO_A });
   await expectWatchInitialized(page, VIDEO_A);
   const reusedControls = page.locator(`[data-fixture-control-video-id="${VIDEO_A}"]`);
-  const reusedLikeButton = reusedControls.locator('[data-ryd-role="like"] button');
-  const reusedDislikeButton = reusedControls.locator('[data-ryd-role="dislike"] button');
+  const reusedLikeButton = reusedControls.locator('[data-fixture-role="like"] button');
+  const reusedDislikeButton = reusedControls.locator('[data-fixture-role="dislike"] button');
   await reusedLikeButton.evaluate((button) => button.setAttribute("data-fixture-pre-navigation-node", "like"));
   await reusedDislikeButton.evaluate((button) => button.setAttribute("data-fixture-pre-navigation-node", "dislike"));
 
@@ -896,9 +898,10 @@ test("pre-navigation native drift cannot satisfy same-node watch refresh for the
 
   await expect(page).toHaveURL((url) => url.pathname === "/watch" && url.searchParams.get("v") === VIDEO_B);
   await page.waitForTimeout(600);
-  await expect(reusedControls.locator('[data-ryd-role="dislike"] #text')).toHaveText("11");
+  await expect(reusedControls.locator('[data-fixture-role="dislike"] #text')).toHaveText("11");
   await expect(page.locator("#ryd-dislike-tooltip")).toContainText("100 / 11");
   await reusedDislikeButton.click();
+  await expect(reusedDislikeButton).toHaveAttribute("aria-pressed", "true");
   await page.waitForTimeout(100);
   expect(
     harness.backend.requestsFor("GET", "/votes").filter((request) => request.query.videoId === VIDEO_B),
@@ -915,6 +918,7 @@ test("pre-navigation native drift cannot satisfy same-node watch refresh for the
 
   await page.evaluate((videoId) => window.__navigationFixture.refreshReusedWatchControl("dislike", videoId), VIDEO_B);
   await expect(reusedDislikeButton).toHaveAttribute("aria-label", `dislike refreshed for ${VIDEO_B}`);
+  await expect(reusedDislikeButton).toHaveAttribute("aria-pressed", "false");
   await expect(reusedDislikeButton).toHaveAttribute("data-fixture-pre-navigation-node", "dislike");
   await expectWatchInitialized(page, VIDEO_B);
   await expectOneActivation(page, harness.backend, VIDEO_B);
@@ -933,8 +937,8 @@ test("navigation-start snapshots same-node watch refreshes that occur before nav
   const harness = await launchNavigationHarness({ context, page }, { pageKind: "watch", videoId: VIDEO_A });
   await expectWatchInitialized(page, VIDEO_A);
   const reusedControls = page.locator(`[data-fixture-control-video-id="${VIDEO_A}"]`);
-  const reusedLikeButton = reusedControls.locator('[data-ryd-role="like"] button');
-  const reusedDislikeButton = reusedControls.locator('[data-ryd-role="dislike"] button');
+  const reusedLikeButton = reusedControls.locator('[data-fixture-role="like"] button');
+  const reusedDislikeButton = reusedControls.locator('[data-fixture-role="dislike"] button');
   await reusedLikeButton.evaluate((button) => button.setAttribute("data-fixture-pre-finish-node", "like"));
   await reusedDislikeButton.evaluate((button) => button.setAttribute("data-fixture-pre-finish-node", "dislike"));
 
@@ -982,8 +986,8 @@ test("navigation-start combines a replaced Like target with a reused Dislike ref
   const harness = await launchNavigationHarness({ context, page }, { pageKind: "watch", videoId: VIDEO_A });
   await expectWatchInitialized(page, VIDEO_A);
   const controls = page.locator(`[data-fixture-control-video-id="${VIDEO_A}"]`);
-  const originalLikeButton = controls.locator('[data-ryd-role="like"] button');
-  const reusedDislikeButton = controls.locator('[data-ryd-role="dislike"] button');
+  const originalLikeButton = controls.locator('[data-fixture-role="like"] button');
+  const reusedDislikeButton = controls.locator('[data-fixture-role="dislike"] button');
   await originalLikeButton.evaluate((button) => {
     window.__fixtureOriginalMixedLikeTarget = button;
   });
@@ -1037,7 +1041,7 @@ test("mobile channel to Short ignores stale channel controls until the target mo
   await page.locator("#channel-short").click();
 
   await expect(page).toHaveURL((url) => url.pathname === `/shorts/${VIDEO_A}`);
-  const decoyDislikeCount = page.locator('[data-fixture-decoy-controls] [data-ryd-role="dislike"] #text');
+  const decoyDislikeCount = page.locator('[data-fixture-decoy-controls] [data-fixture-role="dislike"] #text');
   await page.waitForTimeout(250);
   await expect(decoyDislikeCount).toHaveText("");
   expect(harness.backend.requestsFor("GET", "/votes")).toHaveLength(0);

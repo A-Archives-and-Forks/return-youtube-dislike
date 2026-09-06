@@ -5,15 +5,168 @@ const API_ORIGIN = "https://returnyoutubedislikeapi.com";
 const UNHANDLED_REJECTION_PREFIX = "__RYD_LIVE_UNHANDLED_REJECTION__";
 const MAX_BROWSER_SIGNALS = 50;
 const MAX_API_REQUESTS = 50;
+const EXTENSION_ID_PATTERN = /^[a-p]{32}$/;
+const EXTERNAL_RESOURCE_HOSTS = Object.freeze({
+  doubleclick: "doubleclick.net",
+  googlevideo: "googlevideo.com",
+});
+const EXTERNAL_RESOURCE_FAILURE_PATTERN =
+  /^Failed to load resource: (?:the server responded with a status of 403(?: \([^)]*\))?|net::ERR_(?:BLOCKED_BY_CLIENT|CONNECTION_CLOSED|CONNECTION_REFUSED|CONNECTION_RESET|FAILED|NAME_NOT_RESOLVED|TIMED_OUT))\.?$/;
+const DOUBLECLICK_CORS_PATTERN =
+  /^Access to (?:fetch|XMLHttpRequest) at ['"]([^'"]+)['"](?: \(redirected from ['"]([^'"]+)['"]\))? from origin ['"](https:\/\/(?:www\.|m\.)?youtube\.com)['"] has been blocked by CORS policy: .+$/s;
+const SANDBOXED_ABOUT_BLANK_SCRIPT_MESSAGE =
+  "Blocked script execution in 'about:blank' because the document's frame is sandboxed and the 'allow-scripts' permission is not set.";
+const YOUTUBE_ACCOUNTS_REPORT_ONLY_FRAME_ANCESTORS_MESSAGE =
+  "Framing 'https://accounts.youtube.com/' violates the following report-only Content Security Policy directive: \"frame-ancestors 'self'\". The violation has been logged, but no further action has been taken.\n";
+const YOUTUBE_ROTATE_COOKIES_RATE_LIMIT_PATTERN =
+  /^Failed to load resource: the server responded with a status of 429(?: \([^)]*\))?\.?$/;
+const FATAL_SIGNAL_TYPES = new Set([
+  "console.error",
+  "pageerror",
+  "unhandledrejection",
+  "extension-service-worker.console.error",
+  "extension-service-worker.instrumentation-error",
+  "extension-service-worker.unhandledrejection",
+]);
 
 function serializeError(error) {
   if (!error) return null;
   if (typeof error === "string") return { message: error, name: "Error", stack: null };
-  return {
+  const serialized = {
     message: String(error.message ?? error),
     name: String(error.name ?? "Error"),
     stack: typeof error.stack === "string" ? error.stack : null,
   };
+  if (error instanceof AggregateError) serialized.errors = [...error.errors].map(serializeError);
+  return serialized;
+}
+
+function normalizeIgnoredSignalRules(rules = []) {
+  if (!Array.isArray(rules)) throw new TypeError("ignoredSignalRules must be an array.");
+  const ids = new Set();
+  return rules.map((rule) => {
+    if (!rule || typeof rule !== "object" || Array.isArray(rule)) {
+      throw new TypeError("Each ignored-signal rule must be an object.");
+    }
+    const allowedKeys = new Set(["id", "message", "type", "url"]);
+    const unknownKeys = Object.keys(rule).filter((key) => !allowedKeys.has(key));
+    if (unknownKeys.length > 0) {
+      throw new TypeError(`Ignored-signal rule contains unsupported fields: ${unknownKeys.join(", ")}.`);
+    }
+    if (typeof rule.id !== "string" || rule.id.trim() === "") {
+      throw new TypeError("Each ignored-signal rule requires a non-empty id.");
+    }
+    if (ids.has(rule.id)) throw new TypeError(`Ignored-signal rule id ${rule.id} is duplicated.`);
+    ids.add(rule.id);
+    if (!FATAL_SIGNAL_TYPES.has(rule.type)) {
+      throw new TypeError(`Ignored-signal rule ${rule.id} has an unsupported exact type.`);
+    }
+    if (typeof rule.message !== "string" || rule.message.length === 0) {
+      throw new TypeError(`Ignored-signal rule ${rule.id} requires a non-empty exact message.`);
+    }
+    if (typeof rule.url !== "string" || rule.url.length === 0) {
+      throw new TypeError(`Ignored-signal rule ${rule.id} requires a non-empty exact url.`);
+    }
+    return Object.freeze({ ...rule });
+  });
+}
+
+function signalMessage(signal) {
+  return signal.message ?? signal.error?.message ?? "Unknown browser error";
+}
+
+function signalUrl(signal) {
+  return signal.workerUrl ?? signal.location?.url ?? null;
+}
+
+function ignoredSignalRuleId(signal, rules) {
+  const message = signalMessage(signal);
+  const url = signalUrl(signal);
+  const rule = rules.find((candidate) => {
+    if (candidate.type !== signal.type) return false;
+    return candidate.message === message && candidate.url === url;
+  });
+  return rule?.id ?? null;
+}
+
+function hostnameCategory(value) {
+  let hostname;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.port || url.username || url.password) return null;
+    hostname = url.hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+
+  for (const [category, domain] of Object.entries(EXTERNAL_RESOURCE_HOSTS)) {
+    if (hostname === domain || hostname.endsWith(`.${domain}`)) return category;
+  }
+  return null;
+}
+
+function environmentalConsoleWarningId(signal) {
+  if (signal?.type !== "console.error" || signal.source !== "page") return null;
+  const message = signalMessage(signal);
+  const locationUrl = signal.location?.url;
+  const locationCategory = hostnameCategory(locationUrl);
+
+  if (message === SANDBOXED_ABOUT_BLANK_SCRIPT_MESSAGE && locationUrl === "about:blank") {
+    return "sandboxed-about-blank-script";
+  }
+
+  if (message === YOUTUBE_ACCOUNTS_REPORT_ONLY_FRAME_ANCESTORS_MESSAGE && locationUrl === "") {
+    return "youtube-accounts-report-only-frame-ancestors";
+  }
+
+  if (EXTERNAL_RESOURCE_FAILURE_PATTERN.test(message)) {
+    if (locationCategory === "googlevideo") return "googlevideo-resource-failure";
+    if (locationCategory === "doubleclick") return "doubleclick-resource-failure";
+    return null;
+  }
+
+  if (YOUTUBE_ROTATE_COOKIES_RATE_LIMIT_PATTERN.test(message)) {
+    try {
+      const url = new URL(locationUrl);
+      if (
+        url.protocol === "https:" &&
+        url.hostname.toLowerCase() === "accounts.youtube.com" &&
+        url.pathname === "/RotateCookies" &&
+        !url.port &&
+        !url.username &&
+        !url.password
+      ) {
+        return "youtube-rotate-cookies-rate-limit";
+      }
+    } catch {}
+  }
+
+  const corsMatch = message.match(DOUBLECLICK_CORS_PATTERN);
+  if (!corsMatch || hostnameCategory(corsMatch[1]) !== "doubleclick") return null;
+  const [, , redirectedFrom, origin] = corsMatch;
+  if (redirectedFrom) {
+    try {
+      const redirectUrl = new URL(redirectedFrom);
+      if (
+        redirectUrl.origin !== origin ||
+        !redirectUrl.pathname.startsWith("/pagead/viewthroughconversion/") ||
+        redirectUrl.username ||
+        redirectUrl.password
+      ) {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+  }
+  return "doubleclick-cors";
+}
+
+function extensionServiceWorkerUrl(extensionId) {
+  if (!EXTENSION_ID_PATTERN.test(extensionId ?? "")) {
+    throw new TypeError("selectedExtensionId must be a valid Chrome extension ID.");
+  }
+  return `chrome-extension://${extensionId}/ryd.background.js`;
 }
 
 function installUnhandledRejectionListener(prefix) {
@@ -32,6 +185,211 @@ function installUnhandledRejectionListener(prefix) {
     }
     console.error(`${prefix}${message ?? "Unknown rejection"}`);
   });
+}
+
+class LiveFatalSignalGuard {
+  constructor(
+    page,
+    context,
+    {
+      clock = () => new Date(),
+      ignoredSignalRules = [],
+      log = console.log,
+      onSignal = null,
+      selectedExtensionId = null,
+    } = {},
+  ) {
+    this.clock = clock;
+    this.context = context;
+    this.ignoredSignalRules = normalizeIgnoredSignalRules(ignoredSignalRules);
+    this.log = log;
+    this.onSignal = onSignal;
+    this.page = page;
+    this.selectedExtensionWorkerUrl = selectedExtensionId ? extensionServiceWorkerUrl(selectedExtensionId) : null;
+    this.serviceWorkerListeners = new Map();
+    this.signals = [];
+    this.started = false;
+
+    this.onPageConsole = this.onPageConsole.bind(this);
+    this.onPageError = this.onPageError.bind(this);
+    this.onServiceWorker = this.onServiceWorker.bind(this);
+  }
+
+  now() {
+    return this.clock().toISOString();
+  }
+
+  recordSignal(type, details) {
+    const baseSignal = { at: this.now(), type, ...details };
+    const ignoredBy = ignoredSignalRuleId(baseSignal, this.ignoredSignalRules);
+    const environmentalWarning = environmentalConsoleWarningId(baseSignal);
+    const severity = ignoredBy || environmentalWarning ? "warning" : "fatal";
+    const signal = { ...baseSignal, environmentalWarning, ignoredBy, severity };
+    this.signals.push(signal);
+    this.log(
+      `LIVE_BROWSER_SIGNAL ${type} ${JSON.stringify({ ...details, environmentalWarning, ignoredBy, severity })}`,
+    );
+    this.onSignal?.(signal);
+    return signal;
+  }
+
+  onPageError(error) {
+    this.recordSignal("pageerror", { error: serializeError(error), source: "page" });
+  }
+
+  readConsoleMessage(message) {
+    let location = {};
+    try {
+      location = message.location?.() ?? {};
+    } catch {}
+    return { location, message: message.text() };
+  }
+
+  onPageConsole(consoleMessage) {
+    if (consoleMessage.type() !== "error") return;
+    const { location, message } = this.readConsoleMessage(consoleMessage);
+    if (message.startsWith(UNHANDLED_REJECTION_PREFIX)) {
+      this.recordSignal("unhandledrejection", {
+        location,
+        message: message.slice(UNHANDLED_REJECTION_PREFIX.length),
+        source: "page",
+      });
+      return;
+    }
+    this.recordSignal("console.error", { location, message, source: "page" });
+  }
+
+  async attachServiceWorker(worker) {
+    if (!this.selectedExtensionWorkerUrl || worker.url() !== this.selectedExtensionWorkerUrl) return;
+    if (this.serviceWorkerListeners.has(worker)) return;
+
+    const listener = (consoleMessage) => {
+      if (consoleMessage.type() !== "error") return;
+      const { location, message } = this.readConsoleMessage(consoleMessage);
+      if (message.startsWith(UNHANDLED_REJECTION_PREFIX)) {
+        this.recordSignal("extension-service-worker.unhandledrejection", {
+          location,
+          message: message.slice(UNHANDLED_REJECTION_PREFIX.length),
+          source: "extension-service-worker",
+          workerUrl: this.selectedExtensionWorkerUrl,
+        });
+        return;
+      }
+      this.recordSignal("extension-service-worker.console.error", {
+        location,
+        message,
+        source: "extension-service-worker",
+        workerUrl: this.selectedExtensionWorkerUrl,
+      });
+    };
+    this.serviceWorkerListeners.set(worker, listener);
+    worker.on("console", listener);
+    try {
+      await worker.evaluate(installUnhandledRejectionListener, UNHANDLED_REJECTION_PREFIX);
+    } catch (error) {
+      this.recordSignal("extension-service-worker.instrumentation-error", {
+        error: serializeError(error),
+        source: "extension-service-worker",
+        workerUrl: this.selectedExtensionWorkerUrl,
+      });
+    }
+  }
+
+  onServiceWorker(worker) {
+    void this.attachServiceWorker(worker);
+  }
+
+  async start() {
+    if (this.started) return;
+    this.started = true;
+    this.page.on("console", this.onPageConsole);
+    this.page.on("pageerror", this.onPageError);
+    await this.page.addInitScript(installUnhandledRejectionListener, UNHANDLED_REJECTION_PREFIX);
+    if (!this.page.isClosed()) await this.page.evaluate(installUnhandledRejectionListener, UNHANDLED_REJECTION_PREFIX);
+
+    if (this.selectedExtensionWorkerUrl) {
+      this.context.on("serviceworker", this.onServiceWorker);
+      await Promise.all(this.context.serviceWorkers().map((worker) => this.attachServiceWorker(worker)));
+    }
+  }
+
+  stop() {
+    if (!this.started) return;
+    this.started = false;
+    this.page.off("console", this.onPageConsole);
+    this.page.off("pageerror", this.onPageError);
+    if (this.selectedExtensionWorkerUrl) this.context.off("serviceworker", this.onServiceWorker);
+    for (const [worker, listener] of this.serviceWorkerListeners) worker.off("console", listener);
+    this.serviceWorkerListeners.clear();
+  }
+
+  mark() {
+    return this.signals.length;
+  }
+
+  fatalSignalsBetween(startIndex = 0, endIndex = this.signals.length) {
+    return this.signals.slice(startIndex, endIndex).filter((signal) => signal.severity !== "warning");
+  }
+
+  assertNoFatalSignalsBetween(startIndex = 0, endIndex = this.signals.length, label = "live scenario") {
+    const signals = this.fatalSignalsBetween(startIndex, endIndex);
+    if (signals.length === 0) return;
+    const summary = signals.map((signal) => `${signal.type}: ${signalMessage(signal)}`).join(" | ");
+    const error = new Error(`${label} emitted ${signals.length} fatal browser signal(s): ${summary}`);
+    error.name = "LiveFatalSignalError";
+    error.signals = signals;
+    throw error;
+  }
+}
+
+class LiveReadOnlyGate {
+  constructor(requiredScenarioIds, { allowedSkippedScenarioIds = [] } = {}) {
+    if (!Array.isArray(requiredScenarioIds) || requiredScenarioIds.length === 0) {
+      throw new TypeError("The live read-only gate requires at least one scenario ID.");
+    }
+    if (requiredScenarioIds.some((scenarioId) => typeof scenarioId !== "string" || scenarioId.trim() === "")) {
+      throw new TypeError("Every live read-only gate scenario ID must be a non-empty string.");
+    }
+    if (new Set(requiredScenarioIds).size !== requiredScenarioIds.length) {
+      throw new TypeError("Live read-only gate scenario IDs must be unique.");
+    }
+    if (
+      !Array.isArray(allowedSkippedScenarioIds) ||
+      allowedSkippedScenarioIds.some((scenarioId) => !requiredScenarioIds.includes(scenarioId))
+    ) {
+      throw new TypeError("Allowed skipped scenarios must be a subset of the required live read-only scenarios.");
+    }
+    this.allowedSkipped = new Set(allowedSkippedScenarioIds);
+    this.completed = new Set();
+    this.failed = new Set();
+    this.requiredScenarioIds = Object.freeze([...requiredScenarioIds]);
+  }
+
+  record(scenarioId, outcome) {
+    if (!this.requiredScenarioIds.includes(scenarioId)) {
+      throw new TypeError(`Unknown live read-only scenario: ${scenarioId}`);
+    }
+    if (!["failed", "passed", "skipped"].includes(outcome)) {
+      throw new TypeError(`Unsupported live read-only outcome for ${scenarioId}: ${outcome}`);
+    }
+    if (outcome === "failed" || (outcome === "skipped" && !this.allowedSkipped.has(scenarioId))) {
+      this.completed.delete(scenarioId);
+      this.failed.add(scenarioId);
+      return;
+    }
+    if (this.failed.has(scenarioId)) return;
+    this.completed.add(scenarioId);
+  }
+
+  assertPassed() {
+    const missing = this.requiredScenarioIds.filter((scenarioId) => !this.completed.has(scenarioId));
+    if (this.failed.size === 0 && missing.length === 0) return;
+    throw new Error(
+      `Production reactions are blocked because this worker did not pass every read-only scenario. Missing: ${
+        missing.join(", ") || "none"
+      }; failed: ${[...this.failed].join(", ") || "none"}.`,
+    );
+  }
 }
 
 function readLivePageState() {
@@ -149,9 +507,11 @@ class LiveRunDiagnostics {
     {
       clock = () => new Date(),
       fileSystem = fs,
+      ignoredSignalRules = [],
       log = console.log,
       outputDirectory = path.resolve(__dirname, "../../../../test-results/live-youtube/diagnostics"),
       runtime = null,
+      selectedExtensionId = null,
     } = {},
   ) {
     this.browserSignals = [];
@@ -166,13 +526,19 @@ class LiveRunDiagnostics {
     this.recentApiRequests = [];
     this.requestRecords = new WeakMap();
     this.runtime = runtime;
+    this.fatalSignalCursor = 0;
     this.started = false;
 
-    this.onConsole = this.onConsole.bind(this);
-    this.onPageError = this.onPageError.bind(this);
     this.onRequest = this.onRequest.bind(this);
     this.onRequestFailed = this.onRequestFailed.bind(this);
     this.onResponse = this.onResponse.bind(this);
+    this.fatalSignalGuard = new LiveFatalSignalGuard(page, context, {
+      clock,
+      ignoredSignalRules,
+      log: () => {},
+      onSignal: (signal) => this.recordBrowserSignal(signal),
+      selectedExtensionId,
+    });
   }
 
   now() {
@@ -184,34 +550,16 @@ class LiveRunDiagnostics {
     if (collection.length > maximum) collection.splice(0, collection.length - maximum);
   }
 
-  recordBrowserSignal(type, details) {
-    const signal = {
-      at: this.now(),
+  recordBrowserSignal(signal) {
+    const { at, ...details } = signal;
+    const enrichedSignal = {
+      at,
       checkpoint: this.currentCheckpoint,
       stage: this.currentStage,
-      type,
       ...details,
     };
-    this.appendCapped(this.browserSignals, signal, MAX_BROWSER_SIGNALS);
-    this.log(`LIVE_BROWSER_SIGNAL ${type} ${JSON.stringify(details)}`);
-  }
-
-  onPageError(error) {
-    this.recordBrowserSignal("pageerror", { error: serializeError(error) });
-  }
-
-  onConsole(message) {
-    if (message.type() !== "error") return;
-    const text = message.text();
-    const location = message.location?.() ?? {};
-    if (text.startsWith(UNHANDLED_REJECTION_PREFIX)) {
-      this.recordBrowserSignal("unhandledrejection", {
-        location,
-        message: text.slice(UNHANDLED_REJECTION_PREFIX.length),
-      });
-      return;
-    }
-    this.recordBrowserSignal("console.error", { location, message: text });
+    this.appendCapped(this.browserSignals, enrichedSignal, MAX_BROWSER_SIGNALS);
+    this.log(`LIVE_BROWSER_SIGNAL ${enrichedSignal.type} ${JSON.stringify(details)}`);
   }
 
   onRequest(request) {
@@ -246,22 +594,16 @@ class LiveRunDiagnostics {
   async start() {
     if (this.started) return;
     this.started = true;
-    this.page.on("console", this.onConsole);
-    this.page.on("pageerror", this.onPageError);
+    await this.fatalSignalGuard.start();
     this.context.on("request", this.onRequest);
     this.context.on("requestfailed", this.onRequestFailed);
     this.context.on("response", this.onResponse);
-    await this.page.addInitScript(installUnhandledRejectionListener, UNHANDLED_REJECTION_PREFIX);
-    if (!this.page.isClosed()) {
-      await this.page.evaluate(installUnhandledRejectionListener, UNHANDLED_REJECTION_PREFIX);
-    }
   }
 
   stop() {
     if (!this.started) return;
     this.started = false;
-    this.page.off("console", this.onConsole);
-    this.page.off("pageerror", this.onPageError);
+    this.fatalSignalGuard.stop();
     this.context.off("request", this.onRequest);
     this.context.off("requestfailed", this.onRequestFailed);
     this.context.off("response", this.onResponse);
@@ -289,6 +631,13 @@ class LiveRunDiagnostics {
     this.log(
       `LIVE_STAGE_FAILED ${name} durationMs=${Date.now() - startedAt} error=${JSON.stringify(error?.message ?? String(error))}`,
     );
+  }
+
+  consumeFatalSignals(label) {
+    const startIndex = this.fatalSignalCursor;
+    const endIndex = this.fatalSignalGuard.mark();
+    this.fatalSignalCursor = endIndex;
+    this.fatalSignalGuard.assertNoFatalSignalsBetween(startIndex, endIndex, label);
   }
 
   async snapshot(error) {
@@ -336,23 +685,71 @@ class LiveRunDiagnostics {
 async function runLoggedStage(diagnostics, name, action) {
   const startedAt = Date.now();
   diagnostics.stageStarted(name);
+  let result;
+  let failure = null;
   try {
-    const result = await action();
-    diagnostics.stageCompleted(name, startedAt);
-    return result;
+    result = await action();
   } catch (error) {
-    diagnostics.stageFailed(name, startedAt, error);
+    failure = error;
+  }
+
+  await Promise.resolve();
+  try {
+    diagnostics.consumeFatalSignals?.(name);
+  } catch (signalError) {
+    failure = failure
+      ? new AggregateError([failure, signalError], `${name} failed and emitted fatal browser signals.`)
+      : signalError;
+  }
+
+  if (failure) {
+    diagnostics.stageFailed(name, startedAt, failure);
+    throw failure;
+  }
+  diagnostics.stageCompleted(name, startedAt);
+  return result;
+}
+
+async function runIndependentLoggedStages(diagnostics, stages) {
+  if (!Array.isArray(stages)) throw new TypeError("Independent live stages must be an array.");
+  const results = [];
+  const failures = [];
+  for (const stage of stages) {
+    if (!stage || typeof stage.name !== "string" || typeof stage.action !== "function") {
+      throw new TypeError("Each independent live stage requires a name and action function.");
+    }
+    try {
+      results.push({ name: stage.name, result: await runLoggedStage(diagnostics, stage.name, stage.action) });
+    } catch (error) {
+      failures.push(error);
+      results.push({ error: serializeError(error), name: stage.name });
+    }
+  }
+  if (failures.length > 0) {
+    const error = new AggregateError(
+      failures,
+      `${failures.length} of ${stages.length} independent live read-only stages failed.`,
+    );
+    error.stageResults = results;
     throw error;
   }
+  return results;
 }
 
 module.exports = {
   API_ORIGIN,
+  LiveFatalSignalGuard,
+  LiveReadOnlyGate,
   LiveRunDiagnostics,
   UNHANDLED_REJECTION_PREFIX,
   diagnosticApiUrl,
+  environmentalConsoleWarningId,
+  extensionServiceWorkerUrl,
+  ignoredSignalRuleId,
   installUnhandledRejectionListener,
+  normalizeIgnoredSignalRules,
   readLivePageState,
+  runIndependentLoggedStages,
   runLoggedStage,
   serializeError,
 };

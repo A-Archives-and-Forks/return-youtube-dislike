@@ -1,4 +1,19 @@
-import { getLikeButton, getDislikeButton, getButtons, getLikeTextContainer, getDislikeTextContainer } from "./buttons";
+import {
+  getButtonControls,
+  getLikeButton,
+  getDislikeButton,
+  getButtons,
+  getLikeTextContainer,
+  getDislikeTextContainer,
+  isSyntheticShortsDislike,
+  setSyntheticShortsDislikeEnabled,
+  setSyntheticShortsDislikePressed,
+} from "./buttons";
+import {
+  HIDE_CLUTTER_BUTTONS_STORAGE_KEY,
+  normalizeHideClutterButtons,
+  publishHideClutterButtons,
+} from "./clutter-button-setting";
 import { createRateBar } from "./bar";
 import {
   getBrowser,
@@ -12,6 +27,8 @@ import {
 } from "./utils";
 import { config, getApiEndpoint, DEV_API_URL, PROD_API_URL, isDevelopment } from "./config";
 import { LIKED_STATE, DISLIKED_STATE, NEUTRAL_STATE } from "../../common/vote-transition";
+import { createBrowserSyntheticDislikeStore } from "./vote-client-adapter";
+import { requestVoteData } from "./vote-data-request";
 
 const DEFAULT_SELECTORS = {
   dislikeTextContainer: [
@@ -94,6 +111,7 @@ const DEFAULT_SELECTORS = {
   menuContainer: ["#menu-container"],
   roundedDesign: ["#segmented-like-button", "like-button-view-model"],
 };
+const SELECTOR_REQUEST_TIMEOUT_MS = 1500;
 
 function cloneConfig(value) {
   if (value === undefined) return undefined;
@@ -131,6 +149,7 @@ let extConfig = {
   tooltipPercentageMode: "dash_like",
   numberDisplayReformatLikes: false,
   hidePremiumTeaser: false,
+  hideClutterButtons: false,
   selectors: cloneConfig(DEFAULT_SELECTORS),
 };
 
@@ -158,8 +177,10 @@ function isRoundedDesign() {
 }
 
 let shortsObserver = null;
+let syntheticDislikeStore = null;
 
-if (isShorts() && !shortsObserver) {
+function getShortsObserver() {
+  if (shortsObserver) return shortsObserver;
   console.log("Initializing shorts mutation observer");
   shortsObserver = createObserver(
     {
@@ -167,34 +188,56 @@ if (isShorts() && !shortsObserver) {
     },
     (mutationList) => {
       mutationList.forEach((mutation) => {
-        if (
-          mutation.type === "attributes" &&
-          mutation.target.nodeName === "TP-YT-PAPER-BUTTON" &&
-          mutation.target.id === "button"
-        ) {
-          // console.log('Short thumb button status changed');
+        if (mutation.type === "attributes" && mutation.target.matches?.("button, tp-yt-paper-button#button")) {
           if (mutation.target.getAttribute("aria-pressed") === "true") {
-            mutation.target.style.color =
-              mutation.target.parentElement.parentElement.id === "like-button"
-                ? getColorFromTheme(true)
-                : getColorFromTheme(false);
+            const isLike = mutation.target.closest("like-button-view-model, #like-button") !== null;
+            mutation.target.style.color = getColorFromTheme(isLike);
           } else {
             mutation.target.style.color = "unset";
           }
-          return;
         }
-        console.log("Unexpected mutation observer event: " + mutation.target + mutation.type);
       });
     },
   );
+  return shortsObserver;
 }
 
-function isLikesDisabled() {
+function getSyntheticDislikeStore() {
+  if (syntheticDislikeStore) return syntheticDislikeStore;
+  const browserApi = getBrowser();
+  if (!browserApi?.storage?.local) return null;
+  syntheticDislikeStore = createBrowserSyntheticDislikeStore(
+    browserApi.storage.local,
+    () => browserApi.runtime?.lastError,
+  );
+  return syntheticDislikeStore;
+}
+
+async function readSyntheticShortsDislikeState(videoId) {
+  const store = getSyntheticDislikeStore();
+  if (!store) return false;
+  try {
+    return await store.isDisliked(videoId);
+  } catch (error) {
+    console.debug("Could not restore the synthetic Shorts Dislike state.", error?.message ?? error);
+    return false;
+  }
+}
+
+async function persistSyntheticShortsDislikeState(videoId, disliked) {
+  const store = getSyntheticDislikeStore();
+  if (!store) return;
+  await store.setDisliked(videoId, disliked);
+}
+
+function isLikesDisabled(controls = getButtonControls()) {
   // return true if the like button's text doesn't contain any number
   if (isMobile()) {
-    return /^\D*$/.test(querySelector(extConfig.selectors.buttons.mobileText, getButtons().children[0]).innerText);
+    const mobileLikeText = querySelector(extConfig.selectors.buttons.mobileText, controls.likeButton);
+    return mobileLikeText ? /^\D*$/.test(mobileLikeText.innerText) : true;
   }
-  return /^\D*$/.test(getLikeTextContainer().innerText);
+  const likeTextContainer = getLikeTextContainer(controls.likeButton);
+  return likeTextContainer ? /^\D*$/.test(likeTextContainer.innerText) : true;
 }
 
 function isVideoLiked() {
@@ -232,35 +275,32 @@ function getState(storedData) {
 //---   Sets The Likes And Dislikes Values   ---//
 function setLikes(likesCount) {
   console.log(`SET likes ${likesCount}`);
-  getLikeTextContainer().innerText = likesCount;
+  const likeTextContainer = getLikeTextContainer();
+  if (!likeTextContainer) return false;
+  likeTextContainer.innerText = likesCount;
+  return true;
 }
 
 function setDislikes(dislikesCount) {
   console.log(`SET dislikes ${dislikesCount}`);
 
-  const _container = getDislikeTextContainer();
+  const controls = getButtonControls();
+  const _container = getDislikeTextContainer(controls);
+  if (!_container) return false;
   _container?.removeAttribute("is-empty");
 
   let _dislikeText;
-  if (!isLikesDisabled()) {
-    if (isMobile()) {
-      querySelector(extConfig.selectors.buttons.mobileText, getButtons().children[1]).innerText = dislikesCount;
-      return;
-    }
+  if (!isLikesDisabled(controls)) {
     _dislikeText = dislikesCount;
   } else {
     console.log("likes count disabled by creator");
-    if (isMobile()) {
-      querySelector(extConfig.selectors.buttons.mobileText, getButtons().children[1]).innerText =
-        localize("TextLikesDisabled");
-      return;
-    }
     _dislikeText = localize("TextLikesDisabled");
   }
 
   if (_dislikeText != null && _container?.innerText !== _dislikeText) {
     _container.innerText = _dislikeText;
   }
+  return true;
 }
 
 function getLikeCountFromButton() {
@@ -282,29 +322,32 @@ function getLikeCountFromButton() {
 
 function processResponse(response, storedData) {
   const formattedDislike = numberFormat(response.dislikes);
-  setDislikes(formattedDislike);
+  if (!setDislikes(formattedDislike)) return false;
   if (extConfig.numberDisplayReformatLikes === true) {
     const nativeLikes = getLikeCountFromButton();
     if (nativeLikes !== false) {
       setLikes(numberFormat(nativeLikes));
     }
   }
-  storedData.dislikes = parseInt(response.dislikes);
-  storedData.likes = getLikeCountFromButton() || parseInt(response.likes);
   createRateBar(storedData.likes, storedData.dislikes);
   if (extConfig.coloredThumbs === true) {
     if (isShorts()) {
       // for shorts, leave deactivated buttons in default color
-      let shortLikeButton = querySelector(extConfig.selectors.buttons.shortsToggleButton, getLikeButton());
-      let shortDislikeButton = querySelector(extConfig.selectors.buttons.shortsToggleButton, getDislikeButton());
-      if (shortLikeButton.getAttribute("aria-pressed") === "true") {
+      const shortLikeButton =
+        querySelector(extConfig.selectors.buttons.shortsToggleButton, getLikeButton()) ??
+        getLikeButton()?.querySelector("button");
+      const shortDislikeButton =
+        querySelector(extConfig.selectors.buttons.shortsToggleButton, getDislikeButton()) ??
+        getDislikeButton()?.querySelector("button");
+      if (shortLikeButton?.getAttribute("aria-pressed") === "true") {
         shortLikeButton.style.color = getColorFromTheme(true);
       }
-      if (shortDislikeButton.getAttribute("aria-pressed") === "true") {
+      if (shortDislikeButton?.getAttribute("aria-pressed") === "true") {
         shortDislikeButton.style.color = getColorFromTheme(false);
       }
-      shortsObserver.observe(shortLikeButton);
-      shortsObserver.observe(shortDislikeButton);
+      const observer = getShortsObserver();
+      if (shortLikeButton) observer.observe(shortLikeButton);
+      if (shortDislikeButton) observer.observe(shortDislikeButton);
     } else {
       getLikeButton().style.color = getColorFromTheme(true);
       getDislikeButton().style.color = getColorFromTheme(false);
@@ -313,6 +356,7 @@ function processResponse(response, storedData) {
 
   //Temporary disabling this - it breaks all places where getButtons()[1] is used
   // createStarRating(response.rating, isMobile());
+  return true;
 }
 
 // Tells the user if the API is down
@@ -320,32 +364,36 @@ function displayError(error, videoId = getVideoId(window.location.href)) {
   if (getVideoId(window.location.href) !== videoId) {
     return;
   }
-  getDislikeTextContainer().innerText = localize("textTempUnavailable");
+  const dislikeTextContainer = getDislikeTextContainer();
+  if (!dislikeTextContainer) return false;
+  dislikeTextContainer.innerText = localize("textTempUnavailable");
+  return true;
 }
 
 async function setState(storedData) {
   if (typeof window !== "undefined") {
     window.__rydSetStateCalls = (window.__rydSetStateCalls || 0) + 1;
   }
-  storedData.previousState = isVideoDisliked() ? DISLIKED_STATE : isVideoLiked() ? LIKED_STATE : NEUTRAL_STATE;
+  const videoId = getVideoId(window.location.href);
+  const dislikeButton = getDislikeButton();
+  if (isSyntheticShortsDislike(dislikeButton)) {
+    const storedDisliked = await readSyntheticShortsDislikeState(videoId);
+    if (getVideoId(window.location.href) !== videoId) return;
+    const liked = isVideoLiked();
+    setSyntheticShortsDislikePressed(!liked && storedDisliked, dislikeButton);
+    storedData.previousState = liked ? LIKED_STATE : storedDisliked ? DISLIKED_STATE : NEUTRAL_STATE;
+    if (liked && storedDisliked) void persistSyntheticShortsDislikeState(videoId, false);
+  } else {
+    storedData.previousState = isVideoDisliked() ? DISLIKED_STATE : isVideoLiked() ? LIKED_STATE : NEUTRAL_STATE;
+  }
   console.log("Video is loaded. Adding buttons...");
 
-  const videoId = getVideoId(window.location.href);
   const likeCount = getLikeCountFromButton() || null;
   let response;
   try {
-    const request = await fetch(getApiEndpoint(`/votes?videoId=${videoId}&likeCount=${likeCount || ""}`), {
-      method: "GET",
-      headers: {
-        Accept: "application/json",
-      },
-    });
-    if (!request.ok) {
-      displayError(request.error, videoId);
-      return;
-    }
-    response = await request.json();
+    response = await requestVoteData(videoId, { likeCount });
   } catch (error) {
+    if (error?.name === "AbortError") return false;
     displayError(error, videoId);
     return;
   }
@@ -358,12 +406,31 @@ async function setState(storedData) {
     displayError(response, videoId);
     return;
   }
-  processResponse(response, storedData);
+  // Native reactions can change while counts load, before vote handling is
+  // enabled. Use their current state as the next activation's starting point.
+  const currentControls = getButtonControls();
+  if (currentControls.ready) {
+    const liked = isVideoLiked();
+    if (isSyntheticShortsDislike(currentControls.dislikeButton)) {
+      const disliked = storedData.previousState === DISLIKED_STATE;
+      setSyntheticShortsDislikePressed(!liked && disliked, currentControls.dislikeButton);
+      storedData.previousState = liked ? LIKED_STATE : disliked ? DISLIKED_STATE : NEUTRAL_STATE;
+      if (liked && disliked) void persistSyntheticShortsDislikeState(videoId, false);
+    } else {
+      storedData.previousState = isVideoDisliked() ? DISLIKED_STATE : liked ? LIKED_STATE : NEUTRAL_STATE;
+    }
+  }
+  // Keep a valid destination response even if YouTube replaces its controls
+  // while the request is in flight. The next initialization attempt can then
+  // render the cached state into the hydrated controls without refetching.
+  storedData.dislikes = parseInt(response.dislikes);
+  storedData.likes = parseInt(response.likes);
   storedData.videoId = videoId;
+  return processResponse(response, storedData);
 }
 
 async function setInitialState() {
-  await setState(storedData);
+  return setState(storedData);
 }
 
 function hasLoadedStateForVideo(videoId) {
@@ -371,9 +438,31 @@ function hasLoadedStateForVideo(videoId) {
 }
 
 function restoreCurrentState() {
-  storedData.previousState = isVideoDisliked() ? DISLIKED_STATE : isVideoLiked() ? LIKED_STATE : NEUTRAL_STATE;
-  setDislikes(numberFormat(storedData.dislikes));
+  const dislikeButton = getDislikeButton();
+  if (isSyntheticShortsDislike(dislikeButton)) {
+    setSyntheticShortsDislikePressed(storedData.previousState === DISLIKED_STATE, dislikeButton);
+  } else {
+    storedData.previousState = isVideoDisliked() ? DISLIKED_STATE : isVideoLiked() ? LIKED_STATE : NEUTRAL_STATE;
+  }
+  if (!setDislikes(numberFormat(storedData.dislikes))) return false;
   createRateBar(storedData.likes, storedData.dislikes);
+  return true;
+}
+
+function clearRenderedVoteState(controls = getButtonControls()) {
+  if (!controls) return;
+
+  if (controls.dislikeTextContainer) {
+    controls.dislikeTextContainer.innerText = "";
+  }
+  if (isSyntheticShortsDislike(controls.dislikeButton)) {
+    setSyntheticShortsDislikeEnabled(false, controls.dislikeButton);
+    setSyntheticShortsDislikePressed(false, controls.dislikeButton);
+  }
+
+  for (const wrapper of controls.buttons?.querySelectorAll?.(".ryd-tooltip") ?? []) {
+    wrapper.remove();
+  }
 }
 
 async function initExtConfig() {
@@ -387,22 +476,35 @@ async function initExtConfig() {
   initializeTooltipPercentageMode();
   initializeNumberDisplayReformatLikes();
   initializeHidePremiumTeaser();
+  await initializeHideClutterButtons();
   await initializeSelectors();
 }
 
 async function initializeSelectors() {
-  let result = await fetch(getApiEndpoint("/configs/selectors"), {
-    method: "GET",
-    headers: {
-      Accept: "application/json",
-    },
-  })
-    .then((response) => response.json())
-    .catch((error) => {
-      console.error("Error fetching selectors:", error);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SELECTOR_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(getApiEndpoint("/configs/selectors"), {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+      },
+      signal: controller.signal,
     });
-  extConfig.selectors = mergeConfig(DEFAULT_SELECTORS, result);
-  console.log(result);
+    if (!response.ok) {
+      throw new Error(`Selector request failed with HTTP ${response.status}`);
+    }
+    const result = await response.json();
+    extConfig.selectors = mergeConfig(DEFAULT_SELECTORS, result);
+    console.log(result);
+    return true;
+  } catch (error) {
+    extConfig.selectors = cloneConfig(DEFAULT_SELECTORS);
+    console.debug("Remote selectors unavailable; using bundled selectors.", error?.name ?? error);
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function initializeDisableVoteSubmission() {
@@ -509,6 +611,26 @@ function initializeHidePremiumTeaser() {
   });
 }
 
+function initializeHideClutterButtons() {
+  const storage = getBrowser()?.storage?.sync;
+  if (!storage) {
+    extConfig.hideClutterButtons = publishHideClutterButtons(false);
+    return Promise.resolve(false);
+  }
+
+  return new Promise((resolve) => {
+    storage.get([HIDE_CLUTTER_BUTTONS_STORAGE_KEY], (res = {}) => {
+      const storedValue = res[HIDE_CLUTTER_BUTTONS_STORAGE_KEY];
+      const normalized = normalizeHideClutterButtons(storedValue);
+      extConfig.hideClutterButtons = publishHideClutterButtons(normalized);
+      if (storedValue === undefined) {
+        storage.set({ [HIDE_CLUTTER_BUTTONS_STORAGE_KEY]: false });
+      }
+      resolve(normalized);
+    });
+  });
+}
+
 export {
   isMobile,
   isShorts,
@@ -527,8 +649,12 @@ export {
   NEUTRAL_STATE,
   extConfig,
   initExtConfig,
+  initializeSelectors,
   storedData,
   isLikesDisabled,
   hasLoadedStateForVideo,
   restoreCurrentState,
+  clearRenderedVoteState,
+  persistSyntheticShortsDislikeState,
+  initializeHideClutterButtons,
 };

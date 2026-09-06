@@ -10,16 +10,22 @@ const SHARED_LIVE_SCENARIOS = Object.freeze([
       "navigateFromColdChannelToShort",
       "navigateToNextShort",
       "pausePlayback",
+      "soakCurrentShortsControl",
+      "withExactVotesRequest",
       "withNoProductionInteractions",
     ],
+    driverMethodsByCapability: {
+      "native-pair": ["captureNativeShortsVisual"],
+      "strict-synthetic": ["captureSyntheticShortsVisual"],
+    },
     id: "channel-shorts-navigation",
     implementation: "runChannelShortsNavigationScenario",
   },
   {
     driverMethods: [
       ...COMMON_PRECONDITION_METHODS,
+      "assertCurrentWatchResult",
       "navigateFromColdChannelToWatch",
-      "waitForDislikeText",
       "withNoProductionInteractions",
     ],
     id: "channel-watch-navigation",
@@ -28,8 +34,8 @@ const SHARED_LIVE_SCENARIOS = Object.freeze([
   {
     driverMethods: [
       ...COMMON_PRECONDITION_METHODS,
+      "assertCurrentWatchResult",
       "openPlaylist",
-      "waitForDislikeText",
       "withNoProductionInteractions",
     ],
     id: "watch-render",
@@ -38,9 +44,9 @@ const SHARED_LIVE_SCENARIOS = Object.freeze([
   {
     driverMethods: [
       ...COMMON_PRECONDITION_METHODS,
+      "assertCurrentWatchResult",
       "openPlaylist",
       "reload",
-      "waitForDislikeText",
       "withNoProductionInteractions",
     ],
     id: "reload",
@@ -49,9 +55,9 @@ const SHARED_LIVE_SCENARIOS = Object.freeze([
   {
     driverMethods: [
       ...COMMON_PRECONDITION_METHODS,
+      "assertCurrentWatchResult",
       "navigateWithinPlaylist",
       "openPlaylist",
-      "waitForDislikeText",
       "withNoProductionInteractions",
     ],
     id: "spa-navigation",
@@ -60,7 +66,23 @@ const SHARED_LIVE_SCENARIOS = Object.freeze([
   {
     driverMethods: [
       ...COMMON_PRECONDITION_METHODS,
+      "assertRenderedDislikeCount",
+      "captureWatchActionTopologyVisual",
+      "navigateToRelatedWatch",
+      "openWatch",
+      "readViewportSize",
+      "setViewportSize",
+      "waitForDislikeText",
+      "withNoProductionInteractions",
+    ],
+    id: "watch-action-topology",
+    implementation: "runWatchActionTopologyScenario",
+  },
+  {
+    driverMethods: [
+      ...COMMON_PRECONDITION_METHODS,
       "assertCurrentVideo",
+      "assertRenderedDislikeCount",
       "captureWatchRatioVisual",
       "navigateToRelatedWatch",
       "openWatch",
@@ -71,7 +93,18 @@ const SHARED_LIVE_SCENARIOS = Object.freeze([
     implementation: "runSidebarStressScenario",
   },
   {
-    driverMethods: [...COMMON_PRECONDITION_METHODS, "openShort", "waitForDislikeText", "withNoProductionInteractions"],
+    driverMethods: [
+      ...COMMON_PRECONDITION_METHODS,
+      "assertCurrentShortsControl",
+      "openShort",
+      "reload",
+      "soakCurrentShortsControl",
+      "withNoProductionInteractions",
+    ],
+    driverMethodsByCapability: {
+      "native-pair": ["captureNativeShortsVisual"],
+      "strict-synthetic": ["captureSyntheticShortsVisual"],
+    },
     id: "shorts-render",
     implementation: "runShortsRenderScenario",
   },
@@ -79,6 +112,7 @@ const SHARED_LIVE_SCENARIOS = Object.freeze([
     driverMethods: [
       ...COMMON_PRECONDITION_METHODS,
       "assertCurrentShortsControl",
+      "assertRenderedDislikeCount",
       "captureWatchRatioVisual",
       "openWatch",
       "readViewportSize",
@@ -97,6 +131,22 @@ const SHARED_LIVE_SCENARIOS = Object.freeze([
     driverMethods: [
       ...COMMON_PRECONDITION_METHODS,
       "assertCurrentVideo",
+      "clickAction",
+      "navigateWithinPlaylist",
+      "openPlaylist",
+      "readReactionState",
+      "waitForDislikeText",
+      "waitForReactionState",
+    ],
+    id: "post-navigation-vote",
+    implementation: "runPostNavigationVoteScenario",
+  },
+  {
+    driverMethods: [
+      ...COMMON_PRECONDITION_METHODS,
+      "assertCurrentVideo",
+      "assertDislikeCountChangesObservable",
+      "assertRenderedDislikeCount",
       "captureReactionStateVisual",
       "clickAction",
       "openShort",
@@ -156,11 +206,25 @@ function createSharedLiveScenarioRunner({ implementations = defaultImplementatio
 
     const implementation = requireImplementation(implementations, scenario);
     const scenarioOptions = adapter.createScenarioOptions(options);
+    if (scenarioId === "channel-shorts-navigation") {
+      return implementation(adapter.driver, scenarioOptions, services.shortsNavigationOptions);
+    }
     if (scenarioId === "responsive-visual") {
       return implementation(adapter.driver, scenarioOptions, services.visualOptions);
     }
     if (scenarioId === "sidebar-navigation-stress") {
       return implementation(adapter.driver, scenarioOptions, services.sidebarOptions);
+    }
+    if (scenarioId === "watch-action-topology") {
+      return implementation(adapter.driver, scenarioOptions, services.topologyOptions);
+    }
+    if (scenarioId === "post-navigation-vote") {
+      return implementation(
+        adapter.driver,
+        scenarioOptions,
+        requireService(services, "createRecorder", scenarioId),
+        requireService(services, "consumeVoteApproval", scenarioId),
+      );
     }
     if (scenarioId === "reaction-matrix") {
       return implementation(

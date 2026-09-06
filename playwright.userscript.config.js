@@ -4,6 +4,7 @@ module.exports = defineConfig({
   testDir: "./Extensions/UserScript/e2e",
   testMatch: "**/*.e2e.js",
   testIgnore: "**/live/**",
+  globalSetup: require.resolve("./Extensions/e2e/playwright-userscript-global-setup"),
   fullyParallel: false,
   forbidOnly: Boolean(process.env.CI),
   retries: process.env.CI ? 1 : 0,
@@ -12,7 +13,9 @@ module.exports = defineConfig({
   expect: {
     timeout: 5_000,
   },
-  reporter: process.env.CI ? [["line"], ["html", { open: "never", outputFolder: "playwright-report" }]] : "list",
+  reporter: process.env.CI
+    ? [["line"], ["html", { open: "never", outputFolder: "playwright-report/userscript" }]]
+    : "list",
   use: {
     ...devices["Desktop Chrome"],
     browserName: "chromium",

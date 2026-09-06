@@ -7,5 +7,12 @@ module.exports = {
     "Extensions/combined/*.js",
     "Extensions/UserScript/src/**/*.js",
   ],
-  testPathIgnorePatterns: ["/node_modules/", "<rootDir>/Extensions/UserScript/e2e/"],
+  testPathIgnorePatterns: [
+    "/node_modules/",
+    "<rootDir>/Extensions/combined/dist/",
+    "<rootDir>/test-results/",
+    "<rootDir>/Extensions/combined/e2e/",
+    "<rootDir>/Extensions/e2e/extension/",
+    "<rootDir>/Extensions/UserScript/e2e/",
+  ],
 };
